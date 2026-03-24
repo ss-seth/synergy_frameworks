@@ -310,21 +310,83 @@ def get_series(df: pd.DataFrame, model: str, variable: str) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# Model-dependent variable mapping (Summary sheet — Model Details table)
+# ---------------------------------------------------------------------------
+
+def _parse_model_dependents(rows: list) -> dict:
+    """
+    Find the model/dependent table in the Summary sheet.
+
+    Scans for a header row containing both 'model' and 'dependent'
+    (case-insensitive).  'Model Details' is treated as an optional label
+    column and is ignored.
+
+    Returns {model_name: dependent_variable_name}.
+    """
+    if not rows:
+        return {}
+
+    header_idx = col_model = col_dep = None
+    for i, row in enumerate(rows):
+        if not row:
+            continue
+        lower = [str(c).strip().lower() if c is not None else "" for c in row]
+        # must have exact cells "model" and "dependent"
+        if "model" in lower and "dependent" in lower:
+            header_idx = i
+            col_model  = lower.index("model")
+            col_dep    = lower.index("dependent")
+            break
+
+    if header_idx is None:
+        return {}
+
+    result = {}
+    for row in rows[header_idx + 1:]:
+        if not row:
+            continue
+        max_col = max(col_model, col_dep)
+        if len(row) <= max_col:
+            continue
+        model_val = row[col_model]
+        dep_val   = row[col_dep]
+        if not model_val or str(model_val).strip() in ("", "None", "nan"):
+            break   # first empty row ends the table
+        if dep_val and str(dep_val).strip() not in ("", "None", "nan"):
+            result[str(model_val).strip()] = str(dep_val).strip()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Total model contributions
 # ---------------------------------------------------------------------------
 
 # Variables to exclude from the total — these are derived/predicted rows, not real drivers
 _EXCLUDE_VARS = {"Predicted", "Intercept", "Base", "Residual"}
 
-def get_total_model_contributions(weekly_df: pd.DataFrame, model: str) -> pd.Series:
+def get_total_model_contributions(
+    weekly_df: pd.DataFrame,
+    model: str,
+    dependent_var: Optional[str] = None,
+) -> pd.Series:
     """
     Sum all driver contributions for a model across all variables (by week).
-    Excludes meta-rows like 'Predicted', 'Intercept', 'Base'.
+
+    Excludes meta-rows like 'Predicted', 'Intercept', 'Base', 'Residual'
+    and, when supplied, the model's own dependent variable (to prevent
+    double-counting: sum(predictors) == dependent, so including the dependent
+    row would inflate the total by ~2×).
+
     Returns a DatetimeIndex-indexed Series.
     """
+    exclude = _EXCLUDE_VARS
+    if dependent_var:
+        exclude = exclude | {dependent_var}
+
     mask = weekly_df["model"].str.strip() == model.strip()
     rows = weekly_df[mask]
-    rows = rows[~rows["variable"].str.strip().isin(_EXCLUDE_VARS)]
+    rows = rows[~rows["variable"].str.strip().isin(exclude)]
 
     if rows.empty:
         return pd.Series(dtype=float)
@@ -404,8 +466,10 @@ def load_country_data(country: str) -> Tuple[bool, str, dict]:
 
     data["model_details"] = model_details
 
-    # ---- reporting periods from Summary sheet ----
-    data["reporting_periods"] = _parse_reporting_periods(raw.get("Summary", []))
+    # ---- Summary sheet: reporting periods + model dependents ----
+    summary_rows = raw.get("Summary", [])
+    data["reporting_periods"] = _parse_reporting_periods(summary_rows)
+    data["model_dependents"]  = _parse_model_dependents(summary_rows)
 
     # ---- consolidated variable metadata ----
     if meta_rows:

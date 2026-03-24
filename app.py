@@ -86,9 +86,10 @@ if not success:
     st.error(err_msg)
     st.stop()
 
-weekly   = data.get("weekly", pd.DataFrame())
-wts      = data.get("weekly_transform_support", pd.DataFrame())
-var_meta = data.get("variable_meta", pd.DataFrame())
+weekly           = data.get("weekly", pd.DataFrame())
+wts              = data.get("weekly_transform_support", pd.DataFrame())
+var_meta         = data.get("variable_meta", pd.DataFrame())
+model_dependents = data.get("model_dependents", {})
 
 if weekly.empty:
     st.error("Sheet 'Weekly' not found or empty.")
@@ -99,8 +100,8 @@ if wts.empty:
 
 # ── Reporting period selector (added to sidebar after data is loaded) ─────────
 reporting_periods = data.get("reporting_periods", [])
-period_start: pd.Timestamp | None = None
-period_end:   pd.Timestamp | None = None
+period_start = None
+period_end   = None
 selected_period_name = "Full range"
 
 with st.sidebar:
@@ -289,8 +290,10 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
 
         # Use total model contributions of model1 as Y (if cross-model pair, use m1)
         if m1 not in total_y_cache:
+            dep_var = model_dependents.get(m1)   # exclude dependent to avoid double-count
             total_y_cache[m1] = _clip(
-                get_total_model_contributions(weekly, m1), period_start, period_end
+                get_total_model_contributions(weekly, m1, dependent_var=dep_var),
+                period_start, period_end,
             )
         total_y = total_y_cache[m1]
 
@@ -469,27 +472,31 @@ if (
                 fig = create_synergy_chart(res, d1, d2)
                 st.plotly_chart(fig, use_container_width=True)
 
-    # ── Step 4: Export (only if synergies found) ──────────────────────────────
-    if significant:
-        st.divider()
-        st.subheader("4  Export")
 
-        ecol1, ecol2 = st.columns(2)
-        with ecol1:
-            xlsx_data = export_to_excel(significant, selected_country)
-            st.download_button(
-                label="Download Excel",
-                data=xlsx_data,
-                file_name=f"synergy_{selected_country}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with ecol2:
-            pdf_data = export_to_pdf(significant, selected_country)
-            st.download_button(
-                label="Download PDF",
-                data=pdf_data,
-                file_name=f"synergy_{selected_country}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
+# ── Sidebar: Export (shown whenever significant results are available) ────────
+_cached_results = st.session_state.get("all_results", [])
+_sig_export     = [r for r in _cached_results if r.get("is_significant")]
+_export_country = st.session_state.get("result_country", selected_country)
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Export Results")
+    if _sig_export:
+        xlsx_data = export_to_excel(_sig_export, _export_country)
+        st.download_button(
+            label="Download Excel",
+            data=xlsx_data,
+            file_name=f"synergy_{_export_country}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        pdf_data = export_to_pdf(_sig_export, _export_country)
+        st.download_button(
+            label="Download PDF",
+            data=pdf_data,
+            file_name=f"synergy_{_export_country}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Run analysis to enable export.")
