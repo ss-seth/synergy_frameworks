@@ -97,6 +97,37 @@ if wts.empty:
     st.error("Sheet 'WeeklyTransformSupport' not found or empty.")
     st.stop()
 
+# ── Reporting period selector (added to sidebar after data is loaded) ─────────
+reporting_periods = data.get("reporting_periods", [])
+period_start: pd.Timestamp | None = None
+period_end:   pd.Timestamp | None = None
+selected_period_name = "Full range"
+
+with st.sidebar:
+    st.divider()
+    st.subheader("Reporting Period")
+    if reporting_periods:
+        period_opts = ["Full range"] + [p["period"] for p in reporting_periods]
+        selected_period_name = st.selectbox("Select period", period_opts, key="period_sel")
+        if selected_period_name != "Full range":
+            sel_p = next(p for p in reporting_periods if p["period"] == selected_period_name)
+            period_start = sel_p["start"]
+            period_end   = sel_p["end"]
+            st.caption(
+                f"{period_start.strftime('%d %b %Y')}  –  {period_end.strftime('%d %b %Y')}"
+            )
+    else:
+        st.caption("No reporting periods found in Summary sheet — using full date range.")
+
+
+def _clip(s: pd.Series, start, end) -> pd.Series:
+    """Restrict a DatetimeIndex Series to [start, end] inclusive."""
+    if start is not None:
+        s = s[s.index >= start]
+    if end is not None:
+        s = s[s.index <= end]
+    return s
+
 
 # ── Build variable catalogue ──────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
@@ -241,8 +272,8 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             text=f"Pair {i+1}/{len(pairs)}: {v1} x {v2}",
         )
 
-        ts1 = get_series(wts, m1, v1)
-        ts2 = get_series(wts, m2, v2)
+        ts1 = _clip(get_series(wts, m1, v1), period_start, period_end)
+        ts2 = _clip(get_series(wts, m2, v2), period_start, period_end)
 
         missing = []
         if ts1.empty: missing.append(f"support for '{v1}' in WeeklyTransformSupport")
@@ -258,7 +289,9 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
 
         # Use total model contributions of model1 as Y (if cross-model pair, use m1)
         if m1 not in total_y_cache:
-            total_y_cache[m1] = get_total_model_contributions(weekly, m1)
+            total_y_cache[m1] = _clip(
+                get_total_model_contributions(weekly, m1), period_start, period_end
+            )
         total_y = total_y_cache[m1]
 
         if total_y.empty or total_y.std() < 1e-6:
@@ -275,16 +308,17 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
                     "model1": m1, "model2": m2})
         if not res.get("error"):
             # Original Weekly contributions aligned to the synergy analysis period
-            orig1_s = get_series(weekly, m1, v1)
-            orig2_s = get_series(weekly, m2, v2)
             idx = res["index"]
+            orig1_s = _clip(get_series(weekly, m1, v1), period_start, period_end)
+            orig2_s = _clip(get_series(weekly, m2, v2), period_start, period_end)
             res["orig_contrib1"] = float(orig1_s.reindex(idx).fillna(0).sum())
             res["orig_contrib2"] = float(orig2_s.reindex(idx).fillna(0).sum())
         all_results.append(res)
 
     prog.empty()
-    st.session_state["all_results"] = all_results
-    st.session_state["result_country"] = selected_country
+    st.session_state["all_results"]      = all_results
+    st.session_state["result_country"]   = selected_country
+    st.session_state["result_period"]    = selected_period_name
 
 st.divider()
 
@@ -293,13 +327,15 @@ st.divider()
 if (
     "all_results" in st.session_state
     and st.session_state.get("result_country") == selected_country
+    and st.session_state.get("result_period") == selected_period_name
 ):
     all_results = st.session_state["all_results"]
     significant  = [r for r in all_results if r.get("is_significant")]
     tested_count = len(all_results)
     error_count  = sum(1 for r in all_results if r.get("error"))
 
-    st.subheader("3  Results")
+    result_period = st.session_state.get("result_period", "Full range")
+    st.subheader(f"3  Results  —  {result_period}")
 
     # Summary banner
     bcol1, bcol2, bcol3 = st.columns(3)

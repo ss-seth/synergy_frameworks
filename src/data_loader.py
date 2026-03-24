@@ -66,8 +66,78 @@ def _try_parse_date(val) -> Optional[pd.Timestamp]:
     return None
 
 
+def _parse_cell_date(val) -> Optional[pd.Timestamp]:
+    """Parse a cell value that may be a Python datetime/date object or a string."""
+    if val is None:
+        return None
+    if hasattr(val, "year"):          # datetime / date from openpyxl
+        return pd.Timestamp(val)
+    return _try_parse_date(val)
+
+
 def _date_cols(columns) -> list:
     return [c for c in columns if _try_parse_date(c) is not None]
+
+
+# ---------------------------------------------------------------------------
+# Reporting periods (Summary sheet)
+# ---------------------------------------------------------------------------
+
+def _parse_reporting_periods(rows: list) -> list:
+    """
+    Find the reporting-periods table in the Summary sheet.
+
+    Scans for a header row that contains all three of:
+      'Reporting Period', 'Start Date', 'End Date'
+    (case-insensitive, any column order).
+
+    Returns a list of dicts: [{period, start, end}, ...]
+    where start/end are pd.Timestamp.
+    """
+    if not rows:
+        return []
+
+    header_idx = col_period = col_start = col_end = None
+    for i, row in enumerate(rows):
+        if not row:
+            continue
+        lower = [str(c).strip().lower() if c is not None else "" for c in row]
+        if (
+            "reporting period" in lower
+            and "start date" in lower
+            and "end date" in lower
+        ):
+            header_idx = i
+            col_period = lower.index("reporting period")
+            col_start  = lower.index("start date")
+            col_end    = lower.index("end date")
+            break
+
+    if header_idx is None:
+        return []
+
+    periods = []
+    for row in rows[header_idx + 1:]:
+        if not row:
+            continue
+        max_col = max(col_period, col_start, col_end)
+        if len(row) <= max_col:
+            continue
+        period_val = row[col_period]
+        start_val  = row[col_start]
+        end_val    = row[col_end]
+        if not period_val or str(period_val).strip() in ("", "None", "nan"):
+            break   # treat first empty row as end of table
+        start_dt = _parse_cell_date(start_val)
+        end_dt   = _parse_cell_date(end_val)
+        if start_dt is not None and end_dt is not None:
+            periods.append({
+                "period": str(period_val).strip(),
+                "start":  start_dt,
+                "end":    end_dt,
+            })
+
+    return periods
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +403,9 @@ def load_country_data(country: str) -> Tuple[bool, str, dict]:
                 meta_rows.append(detail_df)
 
     data["model_details"] = model_details
+
+    # ---- reporting periods from Summary sheet ----
+    data["reporting_periods"] = _parse_reporting_periods(raw.get("Summary", []))
 
     # ---- consolidated variable metadata ----
     if meta_rows:
