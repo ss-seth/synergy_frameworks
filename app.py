@@ -330,7 +330,9 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             c = res["coefficients"]
             raw_A   = float(np.sum(res["support1"]        * c[0]))
             raw_B   = float(np.sum(res["support2"]        * c[1]))
-            raw_syn = float(np.sum(res["synergy_support"]  * c[2]))
+            # Clip to zero: negative sum would mean variables are net out-of-phase
+            # (already gated in is_significant, but clip here as a safety net)
+            raw_syn = max(0.0, float(np.sum(res["synergy_support"] * c[2])))
             raw_tot = raw_A + raw_B + raw_syn
             combined = orig_c1 + orig_c2
             if raw_tot > 1e-12 and combined > 0:

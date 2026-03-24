@@ -223,9 +223,14 @@ def compute_synergy_model(
     # Synergy is considered significant when:
     #   • synergy coefficient bootstrap CI lower > 0  (statistically positive)
     #   • ΔR² > 0.001  (practically meaningful improvement)
+    #   • net synergy contribution over the period > 0
+    #     (the deviation / z-score formulations can have negative weekly values;
+    #      if the two variables are net out-of-phase the total sum can be negative
+    #      even with a positive coefficient — that is not a meaningful synergy)
     syn_coeff     = float(b_full[2])
     syn_ci_lower  = float(ci_lower[2])
-    is_significant = syn_ci_lower > 0 and dr2 > 0.001
+    syn_net       = float(np.sum(syn * b_full[2]))   # net contribution over period
+    is_significant = syn_ci_lower > 0 and dr2 > 0.001 and syn_net > 0
 
     return {
         "error":               None,
