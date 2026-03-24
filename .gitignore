@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data files (workbooks are not committed — place them in core_workbook/<country>/)
+core_workbook/**/*.xlsx
+core_workbook/**/*.xlsm
+core_workbook/**/*.xls
+
+# OS
+.DS_Store
