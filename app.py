@@ -314,8 +314,33 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             idx = res["index"]
             orig1_s = _clip(get_series(weekly, m1, v1), period_start, period_end)
             orig2_s = _clip(get_series(weekly, m2, v2), period_start, period_end)
-            res["orig_contrib1"] = float(orig1_s.reindex(idx).fillna(0).sum())
-            res["orig_contrib2"] = float(orig2_s.reindex(idx).fillna(0).sum())
+            orig_c1 = float(orig1_s.reindex(idx).fillna(0).sum())
+            orig_c2 = float(orig2_s.reindex(idx).fillna(0).sum())
+            res["orig_contrib1"] = orig_c1
+            res["orig_contrib2"] = orig_c2
+
+            # Scale synergy model outputs to original contribution space.
+            # The NNLS regresses *total* model Y on just 2 variables, so raw
+            # coefficients × support are inflated (they try to explain the whole
+            # total, not just A/B's slice).  Fix: use the relative proportions
+            # that the model assigns to each component (A, B, synergy) and apply
+            # those proportions to the original combined MMM contribution (C1+C2).
+            # This guarantees adj_A + adj_B + synergy = C1 + C2 and keeps all
+            # five rows on the same contribution scale.
+            c = res["coefficients"]
+            raw_A   = float(np.sum(res["support1"]        * c[0]))
+            raw_B   = float(np.sum(res["support2"]        * c[1]))
+            raw_syn = float(np.sum(res["synergy_support"]  * c[2]))
+            raw_tot = raw_A + raw_B + raw_syn
+            combined = orig_c1 + orig_c2
+            if raw_tot > 1e-12 and combined > 0:
+                res["adj_contrib1"]    = combined * raw_A   / raw_tot
+                res["adj_contrib2"]    = combined * raw_B   / raw_tot
+                res["synergy_contrib"] = combined * raw_syn / raw_tot
+            else:
+                res["adj_contrib1"]    = orig_c1
+                res["adj_contrib2"]    = orig_c2
+                res["synergy_contrib"] = 0.0
         all_results.append(res)
 
     prog.empty()
@@ -450,17 +475,16 @@ if (
 
                 # ── Contribution breakdown ────────────────────────────────────
                 st.markdown("**Contribution Breakdown** — sum over analysis period")
-                c = res["coefficients"]
-                syn_c1  = float(np.sum(res["support1"]       * c[0]))
-                syn_c2  = float(np.sum(res["support2"]       * c[1]))
-                syn_cab = float(np.sum(res["synergy_support"] * c[2]))
-                orig_c1 = res.get("orig_contrib1", 0.0)
-                orig_c2 = res.get("orig_contrib2", 0.0)
+                orig_c1  = res.get("orig_contrib1",  0.0)
+                orig_c2  = res.get("orig_contrib2",  0.0)
+                adj_c1   = res.get("adj_contrib1",   orig_c1)
+                adj_c2   = res.get("adj_contrib2",   orig_c2)
+                syn_cab  = res.get("synergy_contrib", 0.0)
                 contrib_df = pd.DataFrame([
                     {"Description": f"Original model contribution — {lbl1}",          "Value": orig_c1},
                     {"Description": f"Original model contribution — {lbl2}",          "Value": orig_c2},
-                    {"Description": f"Synergy-adjusted contribution — {lbl1}",        "Value": syn_c1},
-                    {"Description": f"Synergy-adjusted contribution — {lbl2}",        "Value": syn_c2},
+                    {"Description": f"Synergy-adjusted contribution — {lbl1}",        "Value": adj_c1},
+                    {"Description": f"Synergy-adjusted contribution — {lbl2}",        "Value": adj_c2},
                     {"Description": f"Synergy contribution — {d1} + {d2}",            "Value": syn_cab},
                 ]).set_index("Description")
                 st.dataframe(

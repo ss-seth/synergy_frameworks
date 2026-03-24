@@ -7,7 +7,6 @@ import io
 import matplotlib
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import numpy as np
 import plotly.graph_objects as go
 import xlsxwriter
 from fpdf import FPDF
@@ -223,17 +222,16 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
         for c_idx, h in enumerate(cb_headers):
             ws.write(cb_start + 1, c_idx, h, hdr)
 
-        c = coeffs
-        syn_c1  = float(np.sum(res["support1"]       * c[0]))
-        syn_c2  = float(np.sum(res["support2"]       * c[1]))
-        syn_cab = float(np.sum(res["synergy_support"] * c[2]))
-        orig_c1 = res.get("orig_contrib1", 0.0)
-        orig_c2 = res.get("orig_contrib2", 0.0)
+        orig_c1 = res.get("orig_contrib1",  0.0)
+        orig_c2 = res.get("orig_contrib2",  0.0)
+        adj_c1  = res.get("adj_contrib1",   orig_c1)
+        adj_c2  = res.get("adj_contrib2",   orig_c2)
+        syn_cab = res.get("synergy_contrib", 0.0)
         cb_rows = [
             (f"Original model contribution — {res['var1']}",         orig_c1),
             (f"Original model contribution — {res['var2']}",         orig_c2),
-            (f"Synergy-adjusted contribution — {res['var1']}",       syn_c1),
-            (f"Synergy-adjusted contribution — {res['var2']}",       syn_c2),
+            (f"Synergy-adjusted contribution — {res['var1']}",       adj_c1),
+            (f"Synergy-adjusted contribution — {res['var2']}",       adj_c2),
             (f"Synergy contribution — {res['var1']} + {res['var2']}", syn_cab),
         ]
         for i, (lbl, val) in enumerate(cb_rows):
@@ -364,17 +362,16 @@ def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
         pdf.ln()
 
         pdf.set_font("Helvetica", size=9)
-        c = res["coefficients"]
-        syn_c1  = float(np.sum(res["support1"]       * c[0]))
-        syn_c2  = float(np.sum(res["support2"]       * c[1]))
-        syn_cab = float(np.sum(res["synergy_support"] * c[2]))
-        orig_c1 = res.get("orig_contrib1", 0.0)
-        orig_c2 = res.get("orig_contrib2", 0.0)
+        orig_c1 = res.get("orig_contrib1",  0.0)
+        orig_c2 = res.get("orig_contrib2",  0.0)
+        adj_c1  = res.get("adj_contrib1",   orig_c1)
+        adj_c2  = res.get("adj_contrib2",   orig_c2)
+        syn_cab = res.get("synergy_contrib", 0.0)
         cb_rows = [
             (f"Original model contribution - {res['var1']}",          orig_c1),
             (f"Original model contribution - {res['var2']}",          orig_c2),
-            (f"Synergy-adjusted contribution - {res['var1']}",        syn_c1),
-            (f"Synergy-adjusted contribution - {res['var2']}",        syn_c2),
+            (f"Synergy-adjusted contribution - {res['var1']}",        adj_c1),
+            (f"Synergy-adjusted contribution - {res['var2']}",        adj_c2),
             (f"Synergy contribution - {res['var1']} + {res['var2']}", syn_cab),
         ]
         for lbl, val in cb_rows:
