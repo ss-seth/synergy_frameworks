@@ -1,15 +1,31 @@
 """
-Synergy model computation.
+Synergy model computation — revised methodology.
 
-For each variable pair (var1, var2):
-  - Dependent variable  : contrib1 + contrib2  (sum of contributions from Weekly)
-  - Independent variables:
-      X1 = transformed support for var1  (from WeeklyTransformSupport)
-      X2 = transformed support for var2  (from WeeklyTransformSupport)
-      X3 = synergy support stream        = (X1/mean(X1)) * (X2/mean(X2))
-  - Constraints : all coefficients >= 0, no intercept, no seasonality
-  - Estimation  : Non-Negative Least Squares (NNLS)
-  - CIs         : Percentile bootstrap at user-specified level
+Why the original approach didn't work
+--------------------------------------
+In a linear MMM, contribution_i = coefficient_i × support_i  (exactly).
+So Y = contrib1 + contrib2 = k1·T1 + k2·T2 with R²_base = 1.0, leaving
+zero residual for any synergy term to explain.
+
+Revised approach
+----------------
+Dependent variable  : total model contributions (sum across ALL variables
+                      for the chosen model, by week).  T1 and T2 each
+                      explain only their own slice of this total, so the
+                      base-model R² is well below 1 and there is residual
+                      variance that a synergy interaction can explain.
+
+Synergy support     : Three formulations are tried; the one with the
+                      greatest ΔR² (R²_full − R²_base) is selected.
+
+  A  Normalised product : (T1/μ1) × (T2/μ2)           -- original spec
+  B  Deviation product  : (T1−μ1) × (T2−μ2)           -- co-elevation
+  C  Z-score product    : z1 × z2                       -- standardised
+
+Constraints         : All coefficients ≥ 0 (NNLS), no intercept,
+                      no seasonality.
+
+Synergy exists      : bootstrap CI lower bound > 0  AND  ΔR² > threshold.
 """
 
 from typing import Tuple
@@ -17,33 +33,60 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 from scipy.optimize import nnls
+from scipy.stats import f as f_dist
 
 
 # ---------------------------------------------------------------------------
-# Synergy support
+# Synergy support formulations
 # ---------------------------------------------------------------------------
 
-def create_synergy_support(s1: pd.Series, s2: pd.Series) -> pd.Series:
-    """
-    Centre each series on 1 by dividing by its mean, then multiply element-wise.
-    Result is the synergy support stream.
-    """
-    m1 = s1.mean()
-    m2 = s2.mean()
-    if m1 == 0 or m2 == 0:
-        return pd.Series(np.zeros(len(s1)), index=s1.index)
-    return (s1 / m1) * (s2 / m2)
+def _synergy_supports(T1: np.ndarray, T2: np.ndarray) -> dict:
+    """Return the three candidate synergy support streams."""
+    m1, m2 = T1.mean(), T2.mean()
+    s1 = T1.std() + 1e-12
+    s2 = T2.std() + 1e-12
+
+    return {
+        "Normalised product":  (T1 / (m1 + 1e-12)) * (T2 / (m2 + 1e-12)),
+        "Deviation product":   (T1 - m1) * (T2 - m2),
+        "Z-score product":     ((T1 - m1) / s1) * ((T2 - m2) / s2),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Constrained estimation
+# NNLS helpers
 # ---------------------------------------------------------------------------
 
 def _fit(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """Non-negative least squares (no intercept)."""
     coeffs, _ = nnls(X, y)
     return coeffs
 
+
+def _r2(y: np.ndarray, y_hat: np.ndarray) -> float:
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    if ss_tot == 0:
+        return 0.0
+    return 1.0 - float(np.sum((y - y_hat) ** 2)) / ss_tot
+
+
+def _f_test(y: np.ndarray, X_base: np.ndarray, X_full: np.ndarray,
+            b_base: np.ndarray, b_full: np.ndarray) -> Tuple[float, float]:
+    """F-test for the synergy term (one extra predictor)."""
+    n = len(y)
+    rss_base = float(np.sum((y - X_base @ b_base) ** 2))
+    rss_full = float(np.sum((y - X_full @ b_full) ** 2))
+    df_base = n - X_base.shape[1]
+    df_full = n - X_full.shape[1]
+    if rss_full == 0 or df_full <= 0:
+        return 0.0, 1.0
+    f_stat = ((rss_base - rss_full) / 1) / (rss_full / df_full)
+    p_val = float(1.0 - f_dist.cdf(f_stat, 1, df_full))
+    return float(f_stat), p_val
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap CIs
+# ---------------------------------------------------------------------------
 
 def _bootstrap_ci(
     y: np.ndarray,
@@ -52,29 +95,22 @@ def _bootstrap_ci(
     n_bootstrap: int,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Percentile bootstrap confidence intervals for NNLS coefficients.
-    Returns (lower, upper) arrays of shape (n_features,).
-    """
     n, p = X.shape
     boot = np.full((n_bootstrap, p), np.nan)
-
     for i in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
         try:
             boot[i] = _fit(y[idx], X[idx])
         except Exception:
             pass
-
-    # Drop failed iterations
     boot = boot[~np.isnan(boot).any(axis=1)]
     if len(boot) == 0:
         return np.zeros(p), np.zeros(p)
-
     alpha = (1.0 - ci_level) / 2.0
-    lower = np.percentile(boot, alpha * 100, axis=0)
-    upper = np.percentile(boot, (1.0 - alpha) * 100, axis=0)
-    return lower, upper
+    return (
+        np.percentile(boot, alpha * 100, axis=0),
+        np.percentile(boot, (1.0 - alpha) * 100, axis=0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -82,83 +118,122 @@ def _bootstrap_ci(
 # ---------------------------------------------------------------------------
 
 def compute_synergy_model(
-    contrib1: pd.Series,
-    contrib2: pd.Series,
-    ts1: pd.Series,
-    ts2: pd.Series,
+    total_y: pd.Series,          # total model contributions (all variables summed)
+    ts1: pd.Series,              # transformed support for var1
+    ts2: pd.Series,              # transformed support for var2
     ci_level: float = 0.95,
     n_bootstrap: int = 1000,
     seed: int = 42,
 ) -> dict:
     """
-    Run the full synergy model for one variable pair.
+    Run the synergy model for one variable pair.
 
     Parameters
     ----------
-    contrib1, contrib2 : contributions from Weekly (DatetimeIndex)
-    ts1, ts2           : transformed support from WeeklyTransformSupport (DatetimeIndex)
-    ci_level           : e.g. 0.95 for 95 % CIs
-    n_bootstrap        : number of bootstrap iterations
-    seed               : random seed for reproducibility
+    total_y    : weekly total contributions for the model (all variables)
+    ts1, ts2   : transformed support series from WeeklyTransformSupport
+    ci_level   : bootstrap CI level
+    n_bootstrap: number of bootstrap iterations
+    seed       : RNG seed
 
     Returns
     -------
     dict with keys:
-        coefficients, ci_lower, ci_upper, r_squared,
+        error, coefficients, ci_lower, ci_upper, r2_base, r2_full,
+        delta_r2, f_stat, p_value, synergy_formulation,
         y, y_hat, support1, support2, synergy_support,
-        index, residuals, n_obs, ci_level, error
+        index, residuals, n_obs, ci_level, is_significant
     """
-    # Align on common date index
+    # Align on common dates
     common = (
-        contrib1.index
-        .intersection(contrib2.index)
+        total_y.index
         .intersection(ts1.index)
         .intersection(ts2.index)
         .sort_values()
     )
 
-    if len(common) < 4:
-        return {"error": "Fewer than 4 overlapping observations — cannot fit model."}
+    if len(common) < 8:
+        return {"error": "Fewer than 8 overlapping observations."}
 
-    y = (contrib1.loc[common] + contrib2.loc[common]).values.astype(float)
-    s1 = ts1.loc[common]
-    s2 = ts2.loc[common]
-    syn = create_synergy_support(s1, s2)
+    Y  = total_y.loc[common].values.astype(float)
+    T1 = ts1.loc[common].values.astype(float)
+    T2 = ts2.loc[common].values.astype(float)
 
-    X = np.column_stack([s1.values, s2.values, syn.values]).astype(float)
-
-    # Remove rows that have NaN in y or X
-    valid = ~(np.isnan(y) | np.isnan(X).any(axis=1))
-    y, X = y[valid], X[valid]
+    # Remove rows with NaN
+    valid = ~(np.isnan(Y) | np.isnan(T1) | np.isnan(T2))
+    Y, T1, T2 = Y[valid], T1[valid], T2[valid]
     idx_valid = common[valid]
 
-    if len(y) < 4:
-        return {"error": "Fewer than 4 non-null observations after alignment."}
+    if len(Y) < 8:
+        return {"error": "Fewer than 8 non-null observations after alignment."}
 
-    coeffs = _fit(y, X)
-    y_hat = X @ coeffs
-    residuals = y - y_hat
+    # Base model (no synergy)
+    X_base = np.column_stack([T1, T2])
+    b_base = _fit(Y, X_base)
+    r2_base = _r2(Y, X_base @ b_base)
 
-    ss_res = float(np.sum(residuals ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    # Try each synergy formulation — pick the one with highest ΔR²
+    best = {"delta_r2": -np.inf}
+    for name, syn in _synergy_supports(T1, T2).items():
+        if np.isnan(syn).any() or np.isinf(syn).any():
+            continue
+        X_full = np.column_stack([T1, T2, syn])
+        b_full = _fit(Y, X_full)
+        r2_full = _r2(Y, X_full @ b_full)
+        dr2 = r2_full - r2_base
+        if dr2 > best["delta_r2"]:
+            best = {
+                "delta_r2": dr2,
+                "name": name,
+                "syn": syn,
+                "b_full": b_full,
+                "r2_full": r2_full,
+                "X_full": X_full,
+            }
+
+    if best.get("delta_r2", -np.inf) == -np.inf:
+        return {"error": "Could not compute any synergy formulation."}
+
+    b_full  = best["b_full"]
+    r2_full = best["r2_full"]
+    syn     = best["syn"]
+    X_full  = best["X_full"]
+    dr2     = best["delta_r2"]
+    fname   = best["name"]
+
+    y_hat     = X_full @ b_full
+    residuals = Y - y_hat
+    f_stat, p_val = _f_test(Y, X_base, X_full, b_base, b_full)
 
     rng = np.random.default_rng(seed)
-    ci_lower, ci_upper = _bootstrap_ci(y, X, ci_level, n_bootstrap, rng)
+    ci_lower, ci_upper = _bootstrap_ci(Y, X_full, ci_level, n_bootstrap, rng)
+
+    # Synergy is considered significant when:
+    #   • synergy coefficient bootstrap CI lower > 0  (statistically positive)
+    #   • ΔR² > 0.001  (practically meaningful improvement)
+    syn_coeff     = float(b_full[2])
+    syn_ci_lower  = float(ci_lower[2])
+    is_significant = syn_ci_lower > 0 and dr2 > 0.001
 
     return {
-        "error":           None,
-        "coefficients":    coeffs,          # [coeff_var1, coeff_var2, coeff_synergy]
-        "ci_lower":        ci_lower,
-        "ci_upper":        ci_upper,
-        "r_squared":       r_squared,
-        "y":               y,               # actual (sum of contributions)
-        "y_hat":           y_hat,           # fitted values
-        "support1":        X[:, 0],
-        "support2":        X[:, 1],
-        "synergy_support": X[:, 2],
-        "index":           idx_valid,       # DatetimeIndex
-        "residuals":       residuals,
-        "n_obs":           int(len(y)),
-        "ci_level":        ci_level,
+        "error":               None,
+        "coefficients":        b_full,          # [var1, var2, synergy]
+        "ci_lower":            ci_lower,
+        "ci_upper":            ci_upper,
+        "r2_base":             r2_base,
+        "r2_full":             r2_full,
+        "delta_r2":            dr2,
+        "f_stat":              f_stat,
+        "p_value":             p_val,
+        "synergy_formulation": fname,
+        "y":                   Y,
+        "y_hat":               y_hat,
+        "support1":            T1,
+        "support2":            T2,
+        "synergy_support":     syn,
+        "index":               idx_valid,
+        "residuals":           residuals,
+        "n_obs":               int(len(Y)),
+        "ci_level":            ci_level,
+        "is_significant":      is_significant,
     }

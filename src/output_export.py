@@ -140,9 +140,9 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
 
     sum_headers = [
         "Pair", "Model 1", "Var 1", "Model 2", "Var 2",
-        "Var 1 Coeff", "Var 2 Coeff",
         "Synergy Coeff", "Synergy CI Lower", "Synergy CI Upper",
-        "R²", "N Obs", "CI Level",
+        "R² Base", "R² with Synergy", "Delta R²",
+        "F-stat", "p-value", "Formulation", "N Obs", "CI Level",
     ]
     for c_idx, h in enumerate(sum_headers):
         ws_sum.write(3, c_idx, h, hdr)
@@ -150,23 +150,26 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
     for r_idx, res in enumerate(results):
         row = r_idx + 4
         if res.get("error"):
-            ws_sum.write(row, 0, f"{res.get('var1','')} × {res.get('var2','')}", txt)
+            ws_sum.write(row, 0, f"{res.get('var1','')} x {res.get('var2','')}", txt)
             ws_sum.write(row, 1, res["error"], err)
             continue
         ci_pct = res["ci_level"]
-        ws_sum.write(row, 0,  f"{res['var1']} × {res['var2']}", txt)
-        ws_sum.write(row, 1,  res["model1"], txt)
-        ws_sum.write(row, 2,  res["var1"],   txt)
-        ws_sum.write(row, 3,  res["model2"], txt)
-        ws_sum.write(row, 4,  res["var2"],   txt)
-        ws_sum.write(row, 5,  res["coefficients"][0], num)
-        ws_sum.write(row, 6,  res["coefficients"][1], num)
-        ws_sum.write(row, 7,  res["coefficients"][2], num)
-        ws_sum.write(row, 8,  res["ci_lower"][2],     num)
-        ws_sum.write(row, 9,  res["ci_upper"][2],     num)
-        ws_sum.write(row, 10, res["r_squared"],        num)
-        ws_sum.write(row, 11, res["n_obs"],            txt)
-        ws_sum.write(row, 12, f"{int(ci_pct*100)}%",  txt)
+        ws_sum.write(row, 0,  f"{res['var1']} x {res['var2']}", txt)
+        ws_sum.write(row, 1,  res["model1"],                    txt)
+        ws_sum.write(row, 2,  res["var1"],                      txt)
+        ws_sum.write(row, 3,  res["model2"],                    txt)
+        ws_sum.write(row, 4,  res["var2"],                      txt)
+        ws_sum.write(row, 5,  res["coefficients"][2],           num)
+        ws_sum.write(row, 6,  res["ci_lower"][2],               num)
+        ws_sum.write(row, 7,  res["ci_upper"][2],               num)
+        ws_sum.write(row, 8,  res.get("r2_base",  0),           num)
+        ws_sum.write(row, 9,  res.get("r2_full",  0),           num)
+        ws_sum.write(row, 10, res.get("delta_r2", 0),           num)
+        ws_sum.write(row, 11, res.get("f_stat",   0),           num)
+        ws_sum.write(row, 12, res.get("p_value",  1),           num)
+        ws_sum.write(row, 13, res.get("synergy_formulation",""),txt)
+        ws_sum.write(row, 14, res["n_obs"],                     txt)
+        ws_sum.write(row, 15, f"{int(ci_pct*100)}%",            txt)
 
     ws_sum.set_column(0, 0, 35)
     ws_sum.set_column(1, 4, 22)
@@ -194,7 +197,10 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
         # Header info
         ws.write(0, 0, f"{res['var1']} × {res['var2']}", ttl)
         ws.write(1, 0, f"Model 1: {res['model1']}  |  Model 2: {res['model2']}", sub)
-        ws.write(2, 0, f"R² = {res['r_squared']:.6f}  |  N = {res['n_obs']}  |  CI = {ci_pct}%", sub)
+        ws.write(2, 0,
+                 f"R2_base={res.get('r2_base',0):.4f}  R2_full={res.get('r2_full',0):.4f}"
+                 f"  dR2={res.get('delta_r2',0):.4f}  N={res['n_obs']}  CI={ci_pct}%"
+                 f"  [{res.get('synergy_formulation','')}]", sub)
 
         # Coefficient table
         ws.write(4, 0, "Coefficient Summary", sub)
@@ -246,6 +252,16 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
 # PDF export
 # ---------------------------------------------------------------------------
 
+def _pdf_safe(text: str) -> str:
+    """Replace characters unsupported by Helvetica with ASCII equivalents."""
+    return (
+        text.replace("\u2014", "-")   # em dash
+            .replace("\u2013", "-")   # en dash
+            .replace("\u00d7", "x")   # multiplication sign
+            .replace("\u00b2", "2")   # superscript 2
+    )
+
+
 def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -256,11 +272,11 @@ def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
     pdf.ln(20)
     pdf.cell(0, 12, "Synergy Calculation Results", ln=True, align="C")
     pdf.set_font("Helvetica", size=13)
-    pdf.cell(0, 9, f"Country: {country}", ln=True, align="C")
+    pdf.cell(0, 9, _pdf_safe(f"Country: {country}"), ln=True, align="C")
     pdf.ln(6)
     pdf.set_font("Helvetica", size=10)
     pdf.cell(0, 7,
-             "Constrained OLS (NNLS) — no intercept — no seasonality — all coefficients >= 0",
+             "Constrained OLS (NNLS) - no intercept - no seasonality - all coefficients >= 0",
              ln=True, align="C")
     pdf.cell(0, 7,
              "Confidence intervals via percentile bootstrap",
@@ -270,23 +286,28 @@ def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
     for res in results:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 10, f"Synergy: {res.get('var1', '')}  x  {res.get('var2', '')}", ln=True)
+        pdf.cell(0, 10, _pdf_safe(f"Synergy: {res.get('var1', '')}  x  {res.get('var2', '')}"), ln=True)
 
         if res.get("error"):
             pdf.set_font("Helvetica", size=10)
             pdf.set_text_color(200, 0, 0)
-            pdf.cell(0, 8, f"Error: {res['error']}", ln=True)
+            pdf.cell(0, 8, _pdf_safe(f"Error: {res['error']}"), ln=True)
             pdf.set_text_color(0, 0, 0)
             continue
 
         ci_pct = int(res["ci_level"] * 100)
         pdf.set_font("Helvetica", size=10)
         pdf.cell(0, 7,
-                 f"Model 1: {res['model1']}    Model 2: {res['model2']}",
+                 _pdf_safe(f"Model 1: {res['model1']}    Model 2: {res['model2']}"),
                  ln=True)
         pdf.cell(0, 7,
-                 f"R² = {res['r_squared']:.4f}     N = {res['n_obs']}     CI = {ci_pct}%",
+                 _pdf_safe(
+                     f"R2_base={res.get('r2_base',0):.4f}  R2_full={res.get('r2_full',0):.4f}"
+                     f"  dR2={res.get('delta_r2',0):.4f}  F={res.get('f_stat',0):.2f}"
+                     f"  p={res.get('p_value',1):.4f}  N={res['n_obs']}  CI={ci_pct}%"
+                 ),
                  ln=True)
+        pdf.cell(0, 7, _pdf_safe(f"Formulation: {res.get('synergy_formulation','')}"), ln=True)
         pdf.ln(3)
 
         # Coefficient table
@@ -302,7 +323,7 @@ def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
         for lbl, coef, lo, hi in zip(
             labels, res["coefficients"], res["ci_lower"], res["ci_upper"]
         ):
-            pdf.cell(col_w[0], 7, lbl[:35], border=1)
+            pdf.cell(col_w[0], 7, _pdf_safe(lbl[:35]), border=1)
             pdf.cell(col_w[1], 7, f"{coef:.6f}", border=1)
             pdf.cell(col_w[2], 7, f"{lo:.6f}",   border=1)
             pdf.cell(col_w[3], 7, f"{hi:.6f}",   border=1)

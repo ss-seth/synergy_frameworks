@@ -240,6 +240,43 @@ def get_series(df: pd.DataFrame, model: str, variable: str) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# Total model contributions
+# ---------------------------------------------------------------------------
+
+# Variables to exclude from the total — these are derived/predicted rows, not real drivers
+_EXCLUDE_VARS = {"Predicted", "Intercept", "Base", "Residual"}
+
+def get_total_model_contributions(weekly_df: pd.DataFrame, model: str) -> pd.Series:
+    """
+    Sum all driver contributions for a model across all variables (by week).
+    Excludes meta-rows like 'Predicted', 'Intercept', 'Base'.
+    Returns a DatetimeIndex-indexed Series.
+    """
+    mask = weekly_df["model"].str.strip() == model.strip()
+    rows = weekly_df[mask]
+    rows = rows[~rows["variable"].str.strip().isin(_EXCLUDE_VARS)]
+
+    if rows.empty:
+        return pd.Series(dtype=float)
+
+    date_cols = [c for c in weekly_df.columns if c not in ("model", "variable")]
+
+    totals = {}
+    for col in date_cols:
+        dt = _try_parse_date(col)
+        if dt is None:
+            continue
+        vals = pd.to_numeric(rows[col], errors="coerce").fillna(0)
+        totals[dt] = float(vals.sum())
+
+    if not totals:
+        return pd.Series(dtype=float)
+
+    s = pd.Series(totals).sort_index()
+    return s
+
+
+# ---------------------------------------------------------------------------
 # Top-level loader
 # ---------------------------------------------------------------------------
 
