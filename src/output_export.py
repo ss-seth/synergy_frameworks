@@ -41,7 +41,7 @@ def create_synergy_chart(result: dict, var1: str, var2: str) -> go.Figure:
 
     fig.add_trace(go.Scatter(
         x=dates, y=result["y_hat"],
-        name=f"Model Fit  (R²={result['r_squared']:.4f})",
+        name=f"Model Fit  (R²={result.get('r2_full', result.get('r_squared', 0)):.4f})",
         line=dict(color="royalblue", width=2, dash="dash"),
         mode="lines",
     ))
@@ -94,7 +94,7 @@ def _mpl_chart(result: dict, var1: str, var2: str) -> io.BytesIO:
     fig, ax = plt.subplots(figsize=(10, 3.8))
     ax.plot(dates, result["y"], color="black", linewidth=2, label="Actual")
     ax.plot(dates, result["y_hat"], color="royalblue", linewidth=1.8,
-            linestyle="--", label=f"Model Fit (R²={result['r_squared']:.4f})")
+            linestyle="--", label=f"Model Fit (R²={result.get('r2_full', result.get('r_squared', 0)):.4f})")
     ax.plot(dates, result["synergy_support"] * c[2], color="crimson",
             linewidth=1.4, linestyle=":", label="Synergy Component")
 

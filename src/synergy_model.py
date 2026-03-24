@@ -40,17 +40,24 @@ from scipy.stats import f as f_dist
 # Synergy support formulations
 # ---------------------------------------------------------------------------
 
+def _safe_scale(arr: np.ndarray) -> np.ndarray:
+    """Divide by RMS so the array has unit scale — prevents ill-conditioning."""
+    rms = np.sqrt(np.mean(arr ** 2))
+    return arr / rms if rms > 1e-12 else arr
+
+
 def _synergy_supports(T1: np.ndarray, T2: np.ndarray) -> dict:
-    """Return the three candidate synergy support streams."""
+    """Return three candidate synergy support streams, each unit-scaled."""
     m1, m2 = T1.mean(), T2.mean()
     s1 = T1.std() + 1e-12
     s2 = T2.std() + 1e-12
 
-    return {
-        "Normalised product":  (T1 / (m1 + 1e-12)) * (T2 / (m2 + 1e-12)),
-        "Deviation product":   (T1 - m1) * (T2 - m2),
-        "Z-score product":     ((T1 - m1) / s1) * ((T2 - m2) / s2),
+    raw = {
+        "Normalised product": (T1 / (m1 + 1e-12)) * (T2 / (m2 + 1e-12)),
+        "Deviation product":  (T1 - m1) * (T2 - m2),
+        "Z-score product":    ((T1 - m1) / s1) * ((T2 - m2) / s2),
     }
+    return {name: _safe_scale(v) for name, v in raw.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +65,12 @@ def _synergy_supports(T1: np.ndarray, T2: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 
 def _fit(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    coeffs, _ = nnls(X, y)
+    n = X.shape[0] * X.shape[1] * 10  # generous iteration budget
+    try:
+        coeffs, _ = nnls(X, y, maxiter=n)
+    except RuntimeError:
+        # Ill-conditioned matrix — fall back to zeros
+        coeffs = np.zeros(X.shape[1])
     return coeffs
 
 

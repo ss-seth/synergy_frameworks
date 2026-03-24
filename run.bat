@@ -32,6 +32,6 @@ if errorlevel 1 (
 
 REM ── 4. Launch Streamlit ──────────────────────────────────────────────────────
 echo [launch] Starting Synergy Calculator ...
-streamlit run app.py
+streamlit run app.py --server.headless=true
 
 pause

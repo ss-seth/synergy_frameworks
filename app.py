@@ -216,7 +216,7 @@ st.divider()
 st.subheader("2  Run Analysis")
 
 if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
-    # Recover (model, variable) tuples
+    # Recover (model, variable, description) tuples
     sel_mv = []
     for _, row in selected_rows.iterrows():
         match = catalogue[
@@ -224,7 +224,8 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             (catalogue["model"]    == row["model"])
         ]
         if not match.empty:
-            sel_mv.append((match.iloc[0]["model"], match.iloc[0]["variable"]))
+            r = match.iloc[0]
+            sel_mv.append((r["model"], r["variable"], r.get("description", "") or ""))
 
     pairs = list(combinations(sel_mv, 2))
     all_results = []
@@ -233,7 +234,7 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
     # Cache total contributions per model to avoid recomputing
     total_y_cache: dict = {}
 
-    for i, ((m1, v1), (m2, v2)) in enumerate(pairs):
+    for i, ((m1, v1, d1), (m2, v2, d2)) in enumerate(pairs):
         prog.progress(
             (i + 1) / len(pairs),
             text=f"Pair {i+1}/{len(pairs)}: {v1} x {v2}",
@@ -247,7 +248,8 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
         if ts2.empty: missing.append(f"support for '{v2}' in WeeklyTransformSupport")
         if missing:
             all_results.append({
-                "var1": v1, "var2": v2, "model1": m1, "model2": m2,
+                "var1": v1, "var2": v2, "desc1": d1, "desc2": d2,
+                "model1": m1, "model2": m2,
                 "error": "Missing data: " + "; ".join(missing),
                 "is_significant": False,
             })
@@ -260,14 +262,16 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
 
         if total_y.empty or total_y.std() < 1e-6:
             all_results.append({
-                "var1": v1, "var2": v2, "model1": m1, "model2": m2,
+                "var1": v1, "var2": v2, "desc1": d1, "desc2": d2,
+                "model1": m1, "model2": m2,
                 "error": f"No usable total contributions found for model '{m1}'.",
                 "is_significant": False,
             })
             continue
 
         res = compute_synergy_model(total_y, ts1, ts2, ci_level, n_bootstrap)
-        res.update({"var1": v1, "var2": v2, "model1": m1, "model2": m2})
+        res.update({"var1": v1, "var2": v2, "desc1": d1, "desc2": d2,
+                    "model1": m1, "model2": m2})
         all_results.append(res)
 
     prog.empty()
@@ -301,31 +305,96 @@ if (
             "Try selecting different variables or lowering the confidence interval threshold."
         )
     else:
+        significant = sorted(significant, key=lambda r: r.get("delta_r2", 0), reverse=True)
         ci_pct = int(ci_level * 100)
 
-        for res in significant:
-            title = f"{res['var1']}  x  {res['var2']}"
+        # ── Summary table with anchor links ──────────────────────────────────
+        st.markdown("#### Significant Synergy Pairs")
+
+        rows_html = ""
+        for idx, res in enumerate(significant):
+            anchor   = f"synergy-pair-{idx}"
+            d1 = res.get("desc1") or res["var1"]
+            d2 = res.get("desc2") or res["var2"]
+            pair_lbl = f"{d1} x {d2}"
+            model_lbl = (
+                res["model1"] if res["model1"] == res["model2"]
+                else f"{res['model1']} / {res['model2']}"
+            )
+            rows_html += (
+                f"<tr>"
+                f"<td style='padding:6px 12px'>{idx+1}</td>"
+                f"<td style='padding:6px 12px'><a href='#{anchor}'>{pair_lbl}</a></td>"
+                f"<td style='padding:6px 12px'>{model_lbl}</td>"
+                f"<td style='padding:6px 12px'>{res.get('delta_r2', 0):.4f}</td>"
+                f"<td style='padding:6px 12px'>{res.get('r2_full', 0):.4f}</td>"
+                f"<td style='padding:6px 12px'>{res['coefficients'][2]:.4f}</td>"
+                f"<td style='padding:6px 12px'>{res.get('f_stat', 0):.2f}</td>"
+                f"<td style='padding:6px 12px'>{res.get('p_value', 1):.4f}</td>"
+                f"<td style='padding:6px 12px'>{res.get('synergy_formulation','')}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"""
+            <table style='border-collapse:collapse; width:100%; font-size:0.88rem'>
+              <thead>
+                <tr style='background:#2E4057; color:white'>
+                  <th style='padding:6px 12px'>#</th>
+                  <th style='padding:6px 12px'>Pair</th>
+                  <th style='padding:6px 12px'>Model</th>
+                  <th style='padding:6px 12px'>Delta R²</th>
+                  <th style='padding:6px 12px'>R² (full)</th>
+                  <th style='padding:6px 12px'>Synergy Coeff</th>
+                  <th style='padding:6px 12px'>F-stat</th>
+                  <th style='padding:6px 12px'>p-value</th>
+                  <th style='padding:6px 12px'>Formulation</th>
+                </tr>
+              </thead>
+              <tbody>{rows_html}</tbody>
+            </table>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+
+        # ── Detail panels ─────────────────────────────────────────────────────
+        for idx, res in enumerate(significant):
+            anchor = f"synergy-pair-{idx}"
+            d1 = res.get("desc1") or res["var1"]
+            d2 = res.get("desc2") or res["var2"]
+            title  = f"{d1}  x  {d2}"
             subtitle = (
                 f"({res['model1']})"
                 if res["model1"] == res["model2"]
                 else f"({res['model1']} / {res['model2']})"
             )
 
-            with st.expander(f"{title}   {subtitle}", expanded=True):
+            # Inject anchor so the summary table links land here
+            st.markdown(f"<div id='{anchor}'></div>", unsafe_allow_html=True)
+
+            with st.expander(f"{idx+1}.  {title}   {subtitle}", expanded=False):
                 # ── Key metrics ───────────────────────────────────────────────
                 mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-                mc1.metric("R² Base",        f"{res['r2_base']:.4f}")
-                mc2.metric("R² with Synergy",f"{res['r2_full']:.4f}")
-                mc3.metric("Delta R²",        f"{res['delta_r2']:.4f}")
-                mc4.metric("Synergy Coeff",   f"{res['coefficients'][2]:.4f}")
-                mc5.metric("F-stat",          f"{res['f_stat']:.2f}")
-                mc6.metric("p-value",         f"{res['p_value']:.4f}")
+                mc1.metric("R² Base",         f"{res['r2_base']:.4f}")
+                mc2.metric("R² with Synergy", f"{res['r2_full']:.4f}")
+                mc3.metric("Delta R²",         f"{res['delta_r2']:.4f}")
+                mc4.metric("Synergy Coeff",    f"{res['coefficients'][2]:.4f}")
+                mc5.metric("F-stat",           f"{res['f_stat']:.2f}")
+                mc6.metric("p-value",          f"{res['p_value']:.4f}")
 
-                st.caption(f"Synergy formulation: **{res['synergy_formulation']}**  |  N = {res['n_obs']}  |  CI = {ci_pct}%")
+                st.caption(
+                    f"**{res['var1']}** | **{res['var2']}**  "
+                    f"|  Formulation: {res['synergy_formulation']}  "
+                    f"|  N = {res['n_obs']}  |  CI = {ci_pct}%"
+                )
 
                 # ── CI table ──────────────────────────────────────────────────
+                lbl1 = f"{d1} ({res['var1']})"
+                lbl2 = f"{d2} ({res['var2']})"
                 ci_df = pd.DataFrame({
-                    "Variable":              [res["var1"], res["var2"], "Synergy"],
+                    "Variable":              [lbl1, lbl2, "Synergy"],
                     "Coefficient":           res["coefficients"],
                     f"CI Lower ({ci_pct}%)": res["ci_lower"],
                     f"CI Upper ({ci_pct}%)": res["ci_upper"],
@@ -333,7 +402,7 @@ if (
                 st.dataframe(ci_df.style.format("{:.6f}"), use_container_width=True)
 
                 # ── Chart ─────────────────────────────────────────────────────
-                fig = create_synergy_chart(res, res["var1"], res["var2"])
+                fig = create_synergy_chart(res, d1, d2)
                 st.plotly_chart(fig, use_container_width=True)
 
     # ── Step 4: Export (only if synergies found) ──────────────────────────────
