@@ -11,6 +11,7 @@ Workflow:
 
 from itertools import combinations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -272,6 +273,13 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
         res = compute_synergy_model(total_y, ts1, ts2, ci_level, n_bootstrap)
         res.update({"var1": v1, "var2": v2, "desc1": d1, "desc2": d2,
                     "model1": m1, "model2": m2})
+        if not res.get("error"):
+            # Original Weekly contributions aligned to the synergy analysis period
+            orig1_s = get_series(weekly, m1, v1)
+            orig2_s = get_series(weekly, m2, v2)
+            idx = res["index"]
+            res["orig_contrib1"] = float(orig1_s.reindex(idx).fillna(0).sum())
+            res["orig_contrib2"] = float(orig2_s.reindex(idx).fillna(0).sum())
         all_results.append(res)
 
     prog.empty()
@@ -400,6 +408,26 @@ if (
                     f"CI Upper ({ci_pct}%)": res["ci_upper"],
                 }).set_index("Variable")
                 st.dataframe(ci_df.style.format("{:.6f}"), use_container_width=True)
+
+                # ── Contribution breakdown ────────────────────────────────────
+                st.markdown("**Contribution Breakdown** — sum over analysis period")
+                c = res["coefficients"]
+                syn_c1  = float(np.sum(res["support1"]       * c[0]))
+                syn_c2  = float(np.sum(res["support2"]       * c[1]))
+                syn_cab = float(np.sum(res["synergy_support"] * c[2]))
+                orig_c1 = res.get("orig_contrib1", 0.0)
+                orig_c2 = res.get("orig_contrib2", 0.0)
+                contrib_df = pd.DataFrame([
+                    {"Description": f"Original model contribution — {lbl1}",          "Value": orig_c1},
+                    {"Description": f"Original model contribution — {lbl2}",          "Value": orig_c2},
+                    {"Description": f"Synergy-adjusted contribution — {lbl1}",        "Value": syn_c1},
+                    {"Description": f"Synergy-adjusted contribution — {lbl2}",        "Value": syn_c2},
+                    {"Description": f"Synergy contribution — {d1} + {d2}",            "Value": syn_cab},
+                ]).set_index("Description")
+                st.dataframe(
+                    contrib_df.style.format({"Value": "{:,.2f}"}),
+                    use_container_width=True,
+                )
 
                 # ── Chart ─────────────────────────────────────────────────────
                 fig = create_synergy_chart(res, d1, d2)

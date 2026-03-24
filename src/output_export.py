@@ -216,8 +216,32 @@ def export_to_excel(results: list, country: str = "") -> io.BytesIO:
             ws.write(6 + i, 2, lo,   num)
             ws.write(6 + i, 3, hi,   num)
 
+        # Contribution breakdown table
+        cb_start = 11
+        ws.write(cb_start, 0, "Contribution Breakdown (sum over analysis period)", sub)
+        cb_headers = ["Description", "Value"]
+        for c_idx, h in enumerate(cb_headers):
+            ws.write(cb_start + 1, c_idx, h, hdr)
+
+        c = coeffs
+        syn_c1  = float(np.sum(res["support1"]       * c[0]))
+        syn_c2  = float(np.sum(res["support2"]       * c[1]))
+        syn_cab = float(np.sum(res["synergy_support"] * c[2]))
+        orig_c1 = res.get("orig_contrib1", 0.0)
+        orig_c2 = res.get("orig_contrib2", 0.0)
+        cb_rows = [
+            (f"Original model contribution — {res['var1']}",         orig_c1),
+            (f"Original model contribution — {res['var2']}",         orig_c2),
+            (f"Synergy-adjusted contribution — {res['var1']}",       syn_c1),
+            (f"Synergy-adjusted contribution — {res['var2']}",       syn_c2),
+            (f"Synergy contribution — {res['var1']} + {res['var2']}", syn_cab),
+        ]
+        for i, (lbl, val) in enumerate(cb_rows):
+            ws.write(cb_start + 2 + i, 0, lbl, txt)
+            ws.write(cb_start + 2 + i, 1, val, num)
+
         # Time series table
-        ts_start_row = 11
+        ts_start_row = cb_start + 2 + len(cb_rows) + 2
         ts_headers = [
             "Date", "Actual", "Fitted",
             f"{res['var1']} Component", f"{res['var2']} Component",
@@ -327,6 +351,35 @@ def export_to_pdf(results: list, country: str = "") -> io.BytesIO:
             pdf.cell(col_w[1], 7, f"{coef:.6f}", border=1)
             pdf.cell(col_w[2], 7, f"{lo:.6f}",   border=1)
             pdf.cell(col_w[3], 7, f"{hi:.6f}",   border=1)
+            pdf.ln()
+
+        pdf.ln(4)
+
+        # Contribution breakdown table
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, "Contribution Breakdown (sum over analysis period)", ln=True)
+        cb_col_w = [130, 44]
+        for w, h in zip(cb_col_w, ["Description", "Value"]):
+            pdf.cell(w, 7, h, border=1)
+        pdf.ln()
+
+        pdf.set_font("Helvetica", size=9)
+        c = res["coefficients"]
+        syn_c1  = float(np.sum(res["support1"]       * c[0]))
+        syn_c2  = float(np.sum(res["support2"]       * c[1]))
+        syn_cab = float(np.sum(res["synergy_support"] * c[2]))
+        orig_c1 = res.get("orig_contrib1", 0.0)
+        orig_c2 = res.get("orig_contrib2", 0.0)
+        cb_rows = [
+            (f"Original model contribution - {res['var1']}",          orig_c1),
+            (f"Original model contribution - {res['var2']}",          orig_c2),
+            (f"Synergy-adjusted contribution - {res['var1']}",        syn_c1),
+            (f"Synergy-adjusted contribution - {res['var2']}",        syn_c2),
+            (f"Synergy contribution - {res['var1']} + {res['var2']}", syn_cab),
+        ]
+        for lbl, val in cb_rows:
+            pdf.cell(cb_col_w[0], 6, _pdf_safe(lbl[:65]), border=1)
+            pdf.cell(cb_col_w[1], 6, f"{val:,.2f}", border=1)
             pdf.ln()
 
         pdf.ln(4)
