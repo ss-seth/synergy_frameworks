@@ -16,3 +16,5 @@ core_workbook/**/*.xls
 
 # OS
 .DS_Store
+*.code-workspace
+Workbook_Archive/
