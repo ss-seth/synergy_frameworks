@@ -353,12 +353,13 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             if b and isinstance(b, str) and b.strip():
                 valid_buckets.append((m, b))
             else:
-                excluded_vars.append(v)
+                var_label = f"{v}" + (f" — {d}" if d else "")
+                excluded_vars.append(var_label)
 
         if excluded_vars:
+            var_list = "\n".join(f"• {var}" for var in sorted(set(excluded_vars)))
             st.info(
-                f"⚠️ **Bucket-level analysis**: The following {len(excluded_vars)} variables don't have bucket assignments and will be excluded from bucket-level synergy calculations:\n\n"
-                f"{', '.join(sorted(set(excluded_vars)))}"
+                f"⚠️ **Bucket-level analysis**: The following {len(excluded_vars)} variables don't have bucket assignments and will be excluded from bucket-level synergy calculations:\n\n{var_list}"
             )
 
         bucket_set = set(valid_buckets)
