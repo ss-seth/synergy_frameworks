@@ -1,2 +1,8 @@
+[logger]
+level = "info"
+
+[client]
+showErrorDetails = true
+
 [browser]
 gatherUsageStats = false

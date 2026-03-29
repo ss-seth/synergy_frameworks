@@ -15,7 +15,7 @@ Excel structure (confirmed from sample workbook):
 
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import openpyxl
@@ -156,10 +156,11 @@ def _load_raw_sheets(xlsx_path: Path) -> dict:
 # Sheet parsers
 # ---------------------------------------------------------------------------
 
-def _parse_contribution_sheet(rows: list) -> pd.DataFrame:
+def _parse_contribution_sheet(rows: list, sheet_name: str = "") -> pd.DataFrame:
     """
     Parse Weekly or WeeklyTransformSupport rows.
     Uses row[0] as headers; keeps col[0] (model), col[1] (variable), + date cols.
+    For Weekly sheet, also extracts classification from the last column (col 172).
     """
     if not rows:
         return pd.DataFrame()
@@ -181,6 +182,13 @@ def _parse_contribution_sheet(rows: list) -> pd.DataFrame:
         for col in dc:
             idx = list(headers).index(col)
             row_dict[col] = pd.to_numeric(row[idx] if idx < len(row) else None, errors="coerce")
+
+        # For Weekly sheet, also extract classification from last column
+        if sheet_name == "Weekly" and len(row) > 171:
+            classification = row[171]  # Column 172 (0-indexed as 171)
+            if classification and str(classification).strip() not in ("", "None"):
+                row_dict["classification"] = str(classification).strip()
+
         data.append(row_dict)
 
     return pd.DataFrame(data)
@@ -365,6 +373,96 @@ def _parse_model_dependents(rows: list) -> dict:
 # Variables to exclude from the total — these are derived/predicted rows, not real drivers
 _EXCLUDE_VARS = {"Predicted", "Intercept", "Base", "Residual"}
 
+def get_classification(
+    weekly_df: pd.DataFrame,
+    model: str,
+    variable: str,
+) -> Optional[str]:
+    """
+    Get the Base/Incremental classification for a variable.
+
+    Returns 'Base', 'Incremental', or None if not found.
+    """
+    if "classification" not in weekly_df.columns:
+        return None
+
+    mask = (
+        (weekly_df["model"].str.strip() == model.strip()) &
+        (weekly_df["variable"].str.strip() == variable.strip())
+    )
+    rows = weekly_df[mask]
+    if rows.empty:
+        return None
+
+    classification = rows.iloc[0]["classification"]
+    if pd.isna(classification):
+        return None
+    return str(classification).strip() if classification else None
+
+
+def get_bucket_series(
+    df: pd.DataFrame,
+    model: str,
+    bucket: str,
+    var_meta: pd.DataFrame,
+) -> Tuple[pd.Series, str]:
+    """
+    Aggregate all variables in a bucket by summing their values.
+
+    For transformations: if all variables use the same transformation, use it.
+    Otherwise, use the transformation of the variable with the greatest total contribution.
+
+    Returns (aggregated_series, selected_transformation).
+    """
+    # Get all variables in this bucket for this model
+    bucket_vars = var_meta[
+        (var_meta["model"].str.strip() == model.strip()) &
+        (var_meta["bucket"].str.strip() == bucket.strip())
+    ]["variable"].tolist()
+
+    if not bucket_vars:
+        return pd.Series(dtype=float), ""
+
+    # Get series for each variable and sum
+    series_list = []
+    for var in bucket_vars:
+        s = get_series(df, model, var)
+        if not s.empty:
+            series_list.append(s)
+
+    if not series_list:
+        return pd.Series(dtype=float), ""
+
+    # Sum all series
+    combined = pd.concat(series_list, axis=1).fillna(0).sum(axis=1)
+
+    # Determine transformation: if all same, use that; otherwise use transformation of highest contributor
+    transformations = []
+    contributions = {}
+    for var in bucket_vars:
+        if var in var_meta["variable"].values:
+            trans = var_meta[var_meta["variable"] == var]["transformation"].iloc[0]
+            transformations.append(trans if not pd.isna(trans) else "")
+
+            # Get contribution (sum over period)
+            s = get_series(df, model, var)
+            contributions[var] = float(s.sum()) if not s.empty else 0.0
+
+    # If all transformations are the same, use that
+    if transformations and len(set(str(t) for t in transformations if t)) <= 1:
+        selected_trans = str(transformations[0]) if transformations[0] else ""
+    else:
+        # Use transformation of highest contributor
+        if contributions:
+            highest_var = max(contributions, key=contributions.get)
+            selected_trans = var_meta[var_meta["variable"] == highest_var]["transformation"].iloc[0]
+            selected_trans = str(selected_trans) if not pd.isna(selected_trans) else ""
+        else:
+            selected_trans = ""
+
+    return combined, selected_trans
+
+
 def get_total_model_contributions(
     weekly_df: pd.DataFrame,
     model: str,
@@ -391,7 +489,7 @@ def get_total_model_contributions(
     if rows.empty:
         return pd.Series(dtype=float)
 
-    date_cols = [c for c in weekly_df.columns if c not in ("model", "variable")]
+    date_cols = [c for c in weekly_df.columns if c not in ("model", "variable", "classification")]
 
     totals = {}
     for col in date_cols:
@@ -434,7 +532,7 @@ def load_country_data(country: str) -> Tuple[bool, str, dict]:
         ("weekly", "Weekly"),
         ("weekly_transform_support", "WeeklyTransformSupport"),
     ]:
-        data[key] = _parse_contribution_sheet(raw.get(sheet_name, []))
+        data[key] = _parse_contribution_sheet(raw.get(sheet_name, []), sheet_name=sheet_name)
 
     # ---- support/spend sheets ----
     for key, sheet_name in [

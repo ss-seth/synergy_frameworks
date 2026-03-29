@@ -227,10 +227,38 @@ def compute_synergy_model(
     #     (the deviation / z-score formulations can have negative weekly values;
     #      if the two variables are net out-of-phase the total sum can be negative
     #      even with a positive coefficient — that is not a meaningful synergy)
+    #   • R² full >= 0  (model fit is at least as good as predicting zero)
+    #   • p-value < 0.05  (F-test is statistically significant at 95% confidence)
+    #   • Both adjusted contributions are meaningful (at least 5% of combined total)
     syn_coeff     = float(b_full[2])
     syn_ci_lower  = float(ci_lower[2])
     syn_net       = float(np.sum(syn * b_full[2]))   # net contribution over period
-    is_significant = syn_ci_lower > 0 and dr2 > 0.001 and syn_net > 0
+
+    # Calculate meaningfulness: contributions should not become negligible after synergy scaling
+    # This prevents cases where one variable's contribution drops to ~zero
+    c = b_full
+    raw_A   = float(np.sum(T1 * c[0]))
+    raw_B   = float(np.sum(T2 * c[1]))
+    raw_syn = max(0.0, float(np.sum(syn * c[2])))
+    raw_tot = raw_A + raw_B + raw_syn
+    combined = np.sum(T1 * c[0]) + np.sum(T2 * c[1]) + np.sum(syn * c[2])
+
+    # Meaningfulness: both variables should represent at least 5% of combined contribution
+    both_meaningful = (
+        raw_tot > 1e-12
+        and abs(combined) > 1e-12
+        and abs(raw_A) / abs(raw_tot) >= 0.05
+        and abs(raw_B) / abs(raw_tot) >= 0.05
+    )
+
+    is_significant = (
+        syn_ci_lower > 0
+        and dr2 > 0.001
+        and syn_net > 0
+        and r2_full >= 0
+        and p_val < 0.05
+        and both_meaningful
+    )
 
     return {
         "error":               None,
@@ -253,4 +281,10 @@ def compute_synergy_model(
         "n_obs":               int(len(Y)),
         "ci_level":            ci_level,
         "is_significant":      is_significant,
+        # Raw model outputs (pre-scaling)
+        "raw_coeff1":          float(raw_A),
+        "raw_coeff2":          float(raw_B),
+        "raw_synergy":         float(raw_syn),
+        "raw_total":           float(raw_tot),
+        "is_meaningful":       both_meaningful,
     }

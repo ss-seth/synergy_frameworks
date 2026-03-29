@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(gh auth:*)"
+      "Bash(gh auth:*)",
+      "Bash(pip install:*)",
+      "Read(//Users/sumair/Library/**)",
+      "Bash(streamlit run:*)",
+      "Bash(python3:*)",
+      "Bash(curl -s http://localhost:8501/health)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(\"/Users/sumair/Library/Mobile Documents/com~apple~CloudDocs/14_Coding_Projects/synergy-calculation/.streamlit/config.toml\":*)"
     ]
   }
 }
