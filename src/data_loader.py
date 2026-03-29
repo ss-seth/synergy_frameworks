@@ -414,10 +414,16 @@ def get_bucket_series(
 
     Returns (aggregated_series, selected_transformation).
     """
+    # Safety checks: ensure bucket is a valid string
+    if not isinstance(bucket, str) or not bucket.strip():
+        return pd.Series(dtype=float), ""
+
     # Get all variables in this bucket for this model
-    bucket_vars = var_meta[
-        (var_meta["model"].str.strip() == model.strip()) &
-        (var_meta["bucket"].str.strip() == bucket.strip())
+    # Filter out NaN/None bucket values
+    valid_buckets = var_meta[pd.notna(var_meta["bucket"])]
+    bucket_vars = valid_buckets[
+        (valid_buckets["model"].str.strip() == model.strip()) &
+        (valid_buckets["bucket"].str.strip() == bucket.strip())
     ]["variable"].tolist()
 
     if not bucket_vars:

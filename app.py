@@ -345,7 +345,23 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
     # Bucket-level pairs (if enabled)
     if include_bucket_level:
         # Get unique (model, bucket) combinations from selected variables
-        bucket_set = set((m, b) for m, v, d, b in sel_mv if b)
+        # Filter out variables without buckets (empty strings, None, or NaN)
+        valid_buckets = []
+        excluded_vars = []
+        for m, v, d, b in sel_mv:
+            # Check if bucket is valid (not empty, None, or NaN)
+            if b and isinstance(b, str) and b.strip():
+                valid_buckets.append((m, b))
+            else:
+                excluded_vars.append(v)
+
+        if excluded_vars:
+            st.info(
+                f"⚠️ **Bucket-level analysis**: The following {len(excluded_vars)} variables don't have bucket assignments and will be excluded from bucket-level synergy calculations:\n\n"
+                f"{', '.join(sorted(set(excluded_vars)))}"
+            )
+
+        bucket_set = set(valid_buckets)
         bucket_list = list(bucket_set)
         bucket_pairs = list(combinations(bucket_list, 2))
 
