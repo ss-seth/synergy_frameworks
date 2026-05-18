@@ -493,6 +493,11 @@ if not can_run and uploaded_template is None:
 elif not can_run:
     st.warning("No valid pairs found in the uploaded template. Check your selections.")
 
+
+def _safe_name(s: str, max_len: int = 28) -> str:
+    return re.sub(r"[^\w\-]", "_", s)[:max_len]
+
+
 if st.button("Run Synergy Analysis", type="primary", disabled=not can_run):
     all_results: list   = []
     prog                = st.progress(0, text="Starting…")
@@ -905,11 +910,6 @@ _cached_results = st.session_state.get("all_results", [])
 _cross_sig      = [r for r in _cached_results if r.get("is_significant") and r.get("pair_type") == "cross_bucket"]
 _intra_sig      = [r for r in _cached_results if r.get("is_significant") and r.get("pair_type") == "intra_bucket"]
 _export_country = st.session_state.get("result_country", selected_country)
-
-
-def _safe_name(s: str, max_len: int = 28) -> str:
-    return re.sub(r"[^\w\-]", "_", s)[:max_len]
-
 
 # Group significant results by model (needed both for summary display and on save)
 _cross_by_model: dict = defaultdict(list)
