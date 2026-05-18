@@ -124,6 +124,20 @@ with st.sidebar:
     else:
         st.caption("No reporting periods found in Summary sheet — using full date range.")
 
+    st.divider()
+    st.subheader("Output Folder")
+    _default_folder = str(Path.home() / "Desktop" / "synergy_output")
+    _sidebar_out_folder = st.text_input(
+        "Save results to",
+        value=st.session_state.get("_out_folder", _default_folder),
+        help="Significant synergies are written here automatically as each model finishes. Leave blank to disable.",
+    )
+    st.session_state["_out_folder"] = _sidebar_out_folder
+    if _sidebar_out_folder:
+        st.caption("Files saved automatically per model during analysis.")
+    else:
+        st.caption("Leave blank to skip auto-save.")
+
 
 def _clip(s: pd.Series, start, end) -> pd.Series:
     if start is not None:
@@ -483,23 +497,32 @@ if st.button("Run Synergy Analysis", type="primary", disabled=not can_run):
     all_results: list   = []
     prog                = st.progress(0, text="Starting…")
     total_y_cache: dict = {}
+    _now_ts             = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # ── Build all pairs ───────────────────────────────────────────────────────
-    pairs = []  # ((m1,v1,d1,bkt1), (m2,v2,d2,bkt2), pair_type)
+    # ── Output folder setup ───────────────────────────────────────────────────
+    _save_folder = st.session_state.get("_out_folder", "").strip()
+    _out_path    = None
+    if _save_folder:
+        try:
+            _out_path = Path(_save_folder)
+            _out_path.mkdir(parents=True, exist_ok=True)
+        except Exception as _exc:
+            st.warning(f"Cannot create output folder '{_save_folder}': {_exc}. Results will not be auto-saved.")
 
-    # Cross-bucket pairs — grouped by model, same model only
+    # ── Build pairs grouped by model ──────────────────────────────────────────
+    model_pairs: dict = defaultdict(list)  # model -> [(info1, info2, pair_type), ...]
+
     if cross_bucket_selections and not var_meta.empty:
-        model_to_buckets: dict = defaultdict(list)
+        _m2b: dict = defaultdict(list)
         for model, bucket in cross_bucket_selections:
-            model_to_buckets[model].append(bucket)
-
-        for model, buckets in model_to_buckets.items():
+            _m2b[model].append(bucket)
+        for model, buckets in _m2b.items():
             for b1, b2 in combinations(buckets, 2):
                 vars1 = var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b1)]
                 vars2 = var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b2)]
                 for _, r1 in vars1.iterrows():
                     for _, r2 in vars2.iterrows():
-                        pairs.append((
+                        model_pairs[model].append((
                             (model, r1["variable"],
                              str(r1.get("description", "") or "").strip(), b1),
                             (model, r2["variable"],
@@ -507,17 +530,14 @@ if st.button("Run Synergy Analysis", type="primary", disabled=not can_run):
                             "cross_bucket",
                         ))
 
-    # Intra-bucket pairs
     if intra_var_selections:
-        # Build a description lookup from var_meta
         desc_lookup = {}
         bkt_lookup  = {}
         if not var_meta.empty:
             for _, row in var_meta.iterrows():
                 key = (str(row["model"]).strip(), str(row["variable"]).strip())
                 desc_lookup[key] = str(row.get("description", "") or "").strip()
-                bkt_lookup[key]  = str(row.get("bucket", "")      or "").strip()
-
+                bkt_lookup[key]  = str(row.get("bucket",      "") or "").strip()
         for (model, bucket), vars_list in intra_var_selections.items():
             if len(vars_list) < 2:
                 continue
@@ -526,85 +546,122 @@ if st.button("Run Synergy Analysis", type="primary", disabled=not can_run):
                 d2 = desc_lookup.get((model, v2), "")
                 b1 = bkt_lookup.get((model, v1), bucket)
                 b2 = bkt_lookup.get((model, v2), bucket)
-                pairs.append((
+                model_pairs[model].append((
                     (model, v1, d1, b1),
                     (model, v2, d2, b2),
                     "intra_bucket",
                 ))
 
-    # ── Run each pair ─────────────────────────────────────────────────────────
-    for pair_idx, ((m1, id1, desc1, bkt1), (m2, id2, desc2, bkt2), pair_type) in enumerate(pairs):
-        prog.progress(
-            (pair_idx + 1) / max(len(pairs), 1),
-            text=f"Pair {pair_idx+1}/{len(pairs)}: {id1} × {id2} ({pair_type})",
-        )
+    total_pairs     = sum(len(p) for p in model_pairs.values())
+    global_pair_idx = 0
 
-        ts1     = _clip(get_series(wts,    m1, id1), period_start, period_end)
-        ts2     = _clip(get_series(wts,    m2, id2), period_start, period_end)
-        orig1_s = _clip(get_series(weekly, m1, id1), period_start, period_end)
-        orig2_s = _clip(get_series(weekly, m2, id2), period_start, period_end)
+    # ── Process model by model, saving after each ─────────────────────────────
+    for model in sorted(model_pairs.keys()):
+        model_results: list = []
 
-        missing = []
-        if ts1.empty: missing.append(f"support for '{id1}' in WeeklyTransformSupport")
-        if ts2.empty: missing.append(f"support for '{id2}' in WeeklyTransformSupport")
-        if missing:
-            all_results.append({
-                "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
-                "bucket1": bkt1, "bucket2": bkt2,
-                "model1": m1, "model2": m2, "pair_type": pair_type,
-                "error": "Missing data: " + "; ".join(missing),
-                "is_significant": False,
-            })
-            continue
-
-        if m1 not in total_y_cache:
-            dep_var = model_dependents.get(m1)
-            total_y_cache[m1] = _clip(
-                get_total_model_contributions(weekly, m1, dependent_var=dep_var),
-                period_start, period_end,
+        for (m1, id1, desc1, bkt1), (m2, id2, desc2, bkt2), pair_type in model_pairs[model]:
+            global_pair_idx += 1
+            prog.progress(
+                global_pair_idx / max(total_pairs, 1),
+                text=f"[{model}] {global_pair_idx}/{total_pairs}: {id1} × {id2}",
             )
-        total_y = total_y_cache[m1]
 
-        if total_y.empty or total_y.std() < 1e-6:
-            all_results.append({
+            ts1     = _clip(get_series(wts,    m1, id1), period_start, period_end)
+            ts2     = _clip(get_series(wts,    m2, id2), period_start, period_end)
+            orig1_s = _clip(get_series(weekly, m1, id1), period_start, period_end)
+            orig2_s = _clip(get_series(weekly, m2, id2), period_start, period_end)
+
+            missing = []
+            if ts1.empty: missing.append(f"support for '{id1}' in WeeklyTransformSupport")
+            if ts2.empty: missing.append(f"support for '{id2}' in WeeklyTransformSupport")
+            if missing:
+                model_results.append({
+                    "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
+                    "bucket1": bkt1, "bucket2": bkt2,
+                    "model1": m1, "model2": m2, "pair_type": pair_type,
+                    "error": "Missing data: " + "; ".join(missing),
+                    "is_significant": False,
+                })
+                continue
+
+            if m1 not in total_y_cache:
+                dep_var = model_dependents.get(m1)
+                total_y_cache[m1] = _clip(
+                    get_total_model_contributions(weekly, m1, dependent_var=dep_var),
+                    period_start, period_end,
+                )
+            total_y = total_y_cache[m1]
+
+            if total_y.empty or total_y.std() < 1e-6:
+                model_results.append({
+                    "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
+                    "bucket1": bkt1, "bucket2": bkt2,
+                    "model1": m1, "model2": m2, "pair_type": pair_type,
+                    "error": f"No usable total contributions found for model '{m1}'.",
+                    "is_significant": False,
+                })
+                continue
+
+            res = compute_synergy_model(total_y, ts1, ts2, ci_level, n_bootstrap)
+            res.update({
                 "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
                 "bucket1": bkt1, "bucket2": bkt2,
                 "model1": m1, "model2": m2, "pair_type": pair_type,
-                "error": f"No usable total contributions found for model '{m1}'.",
-                "is_significant": False,
             })
-            continue
 
-        res = compute_synergy_model(total_y, ts1, ts2, ci_level, n_bootstrap)
-        res.update({
-            "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
-            "bucket1": bkt1, "bucket2": bkt2,
-            "model1": m1, "model2": m2, "pair_type": pair_type,
-        })
+            if not res.get("error"):
+                idx     = res["index"]
+                orig_c1 = float(orig1_s.reindex(idx).fillna(0).sum())
+                orig_c2 = float(orig2_s.reindex(idx).fillna(0).sum())
+                res["orig_contrib1"] = orig_c1
+                res["orig_contrib2"] = orig_c2
 
-        if not res.get("error"):
-            idx     = res["index"]
-            orig_c1 = float(orig1_s.reindex(idx).fillna(0).sum())
-            orig_c2 = float(orig2_s.reindex(idx).fillna(0).sum())
-            res["orig_contrib1"] = orig_c1
-            res["orig_contrib2"] = orig_c2
+                c       = res["coefficients"]
+                raw_A   = float(np.sum(res["support1"]        * c[0]))
+                raw_B   = float(np.sum(res["support2"]        * c[1]))
+                raw_syn = max(0.0, float(np.sum(res["synergy_support"] * c[2])))
+                raw_tot = raw_A + raw_B + raw_syn
+                combined = orig_c1 + orig_c2
+                if raw_tot > 1e-12 and combined > 0:
+                    res["adj_contrib1"]    = combined * raw_A   / raw_tot
+                    res["adj_contrib2"]    = combined * raw_B   / raw_tot
+                    res["synergy_contrib"] = combined * raw_syn / raw_tot
+                else:
+                    res["adj_contrib1"]    = orig_c1
+                    res["adj_contrib2"]    = orig_c2
+                    res["synergy_contrib"] = 0.0
 
-            c       = res["coefficients"]
-            raw_A   = float(np.sum(res["support1"]        * c[0]))
-            raw_B   = float(np.sum(res["support2"]        * c[1]))
-            raw_syn = max(0.0, float(np.sum(res["synergy_support"] * c[2])))
-            raw_tot = raw_A + raw_B + raw_syn
-            combined = orig_c1 + orig_c2
-            if raw_tot > 1e-12 and combined > 0:
-                res["adj_contrib1"]    = combined * raw_A   / raw_tot
-                res["adj_contrib2"]    = combined * raw_B   / raw_tot
-                res["synergy_contrib"] = combined * raw_syn / raw_tot
-            else:
-                res["adj_contrib1"]    = orig_c1
-                res["adj_contrib2"]    = orig_c2
-                res["synergy_contrib"] = 0.0
+            model_results.append(res)
 
-        all_results.append(res)
+        all_results.extend(model_results)
+
+        # ── Save this model's results to folder ───────────────────────────────
+        if _out_path is not None:
+            _safe_m      = _safe_name(model)
+            _m_cross_sig = [r for r in model_results if r.get("is_significant") and r.get("pair_type") == "cross_bucket"]
+            _m_intra_sig = [r for r in model_results if r.get("is_significant") and r.get("pair_type") == "intra_bucket"]
+            _n_sig       = len(_m_cross_sig) + len(_m_intra_sig)
+            _save_errors = []
+
+            for _res_list, _tag in [(_m_cross_sig, "bucket"), (_m_intra_sig, "variable")]:
+                if not _res_list:
+                    continue
+                try:
+                    (_out_path / f"synergy_{_tag}_{_safe_m}_{_now_ts}.xlsx").write_bytes(
+                        export_to_excel(_res_list, selected_country).read()
+                    )
+                    (_out_path / f"synergy_{_tag}_{_safe_m}_{_now_ts}.pdf").write_bytes(
+                        export_to_pdf(_res_list, selected_country).read()
+                    )
+                except Exception as _exc:
+                    _save_errors.append(f"{_tag}: {_exc}")
+
+            if _n_sig > 0 and not _save_errors:
+                st.success(f"**{model}** — {_n_sig} synerg{'ies' if _n_sig != 1 else 'y'} saved to folder.")
+            elif _n_sig == 0:
+                st.info(f"**{model}** — no significant synergies found.")
+            for _e in _save_errors:
+                st.error(f"**{model}** save error — {_e}")
 
     prog.empty()
     st.session_state["all_results"]    = all_results
@@ -869,12 +926,11 @@ _all_export_models = sorted(
 
 with st.sidebar:
     st.divider()
-    st.subheader("Export Results")
+    st.subheader("Re-save Results")
 
     if not _cross_sig and not _intra_sig:
         st.caption("Run analysis to enable export.")
     else:
-        # Summary of what will be exported
         for _model in _all_export_models:
             _m_cross = _cross_by_model.get(_model, [])
             _m_intra = _intra_by_model.get(_model, [])
@@ -885,53 +941,39 @@ with st.sidebar:
                 f"({len(_m_cross)} cross-bucket, {len(_m_intra)} intra-bucket)"
             )
 
-        st.divider()
+        st.caption("Folder set above. Click to overwrite with latest results.")
 
-        _default_folder = str(Path.home() / "Desktop" / "synergy_output")
-        _out_folder = st.text_input(
-            "Output folder",
-            value=st.session_state.get("_out_folder", _default_folder),
-            help="Files are written directly to this path. Created automatically if it doesn't exist.",
-        )
-        st.session_state["_out_folder"] = _out_folder
-
-        if st.button("Save Results to Folder", type="primary", use_container_width=True):
-            _now_ts = datetime.now().strftime("%Y%m%d_%H%M")
-            try:
-                _out_path = Path(_out_folder)
-                _out_path.mkdir(parents=True, exist_ok=True)
-
-                _saved: list = []
-                _errs:  list = []
-
-                for _model in _all_export_models:
-                    _safe_m  = _safe_name(_model)
-                    _m_cross = _cross_by_model.get(_model, [])
-                    _m_intra = _intra_by_model.get(_model, [])
-
-                    for _res_list, _tag in [(_m_cross, "bucket"), (_m_intra, "variable")]:
-                        if not _res_list:
-                            continue
-                        try:
-                            _xl_name  = f"synergy_{_tag}_{_safe_m}_{_now_ts}.xlsx"
-                            _pdf_name = f"synergy_{_tag}_{_safe_m}_{_now_ts}.pdf"
-                            (_out_path / _xl_name).write_bytes(
-                                export_to_excel(_res_list, _export_country).read()
-                            )
-                            (_out_path / _pdf_name).write_bytes(
-                                export_to_pdf(_res_list, _export_country).read()
-                            )
-                            _saved.extend([_xl_name, _pdf_name])
-                        except Exception as _exc:
-                            _errs.append(f"{_model} ({_tag}): {_exc}")
-
-                if _saved:
-                    st.success(f"Saved {len(_saved)} file(s) to:\n`{_out_folder}`")
-                    for _f in _saved:
-                        st.caption(f"• {_f}")
-                if _errs:
+        if st.button("Re-save to Folder", use_container_width=True):
+            _resave_folder = st.session_state.get("_out_folder", "").strip()
+            if not _resave_folder:
+                st.error("Set an output folder above first.")
+            else:
+                _now_ts = datetime.now().strftime("%Y%m%d_%H%M")
+                try:
+                    _out_path = Path(_resave_folder)
+                    _out_path.mkdir(parents=True, exist_ok=True)
+                    _saved: list = []
+                    _errs:  list = []
+                    for _model in _all_export_models:
+                        _safe_m  = _safe_name(_model)
+                        _m_cross = _cross_by_model.get(_model, [])
+                        _m_intra = _intra_by_model.get(_model, [])
+                        for _res_list, _tag in [(_m_cross, "bucket"), (_m_intra, "variable")]:
+                            if not _res_list:
+                                continue
+                            try:
+                                (_out_path / f"synergy_{_tag}_{_safe_m}_{_now_ts}.xlsx").write_bytes(
+                                    export_to_excel(_res_list, _export_country).read()
+                                )
+                                (_out_path / f"synergy_{_tag}_{_safe_m}_{_now_ts}.pdf").write_bytes(
+                                    export_to_pdf(_res_list, _export_country).read()
+                                )
+                                _saved.append(f"{_model} ({_tag})")
+                            except Exception as _exc:
+                                _errs.append(f"{_model} ({_tag}): {_exc}")
+                    if _saved:
+                        st.success(f"Re-saved {len(_saved)} export(s).")
                     for _e in _errs:
                         st.error(f"Error — {_e}")
-
-            except Exception as _exc:
-                st.error(f"Could not write to folder: {_exc}")
+                except Exception as _exc:
+                    st.error(f"Could not write to folder: {_exc}")
