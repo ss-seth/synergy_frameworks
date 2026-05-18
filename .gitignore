@@ -1,5 +1,6 @@
-# Virtual environment
+# Virtual environments (platform-specific, never committed)
 .venv/
+.venv_win/
 
 # Python
 __pycache__/
