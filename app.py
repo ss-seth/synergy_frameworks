@@ -2,27 +2,31 @@
 Synergy Calculation Tool — Streamlit app.
 
 Workflow:
-  1. Select country (dropdown)
-  2. Browse and select variables (grouped table with model, variable, description, bucket)
-  3. Configure CI level + bootstrap iterations
-  4. Run analysis → one model per unique pair
-  5. View significant synergies + download Excel / PDF
+  1. Download the pre-filled selection template, mark 'y' in 'Include in Test'
+  2. Upload the completed template — pairs are previewed grouped by model
+  3. Configure CI + bootstrap settings
+  4. Run analysis → one NNLS model per unique variable pair
+  5. View significant synergies + download ZIP with Excel/PDF per model
 """
 
+import io
+import re
+import zipfile
+from collections import defaultdict
+from datetime import datetime
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import xlsxwriter as _xlsxwriter
 
 from src.data_loader import (
-    get_bucket_series,
-    get_classification,
     get_countries,
     get_series,
     get_total_model_contributions,
     load_country_data,
-    parse_transformation,
 )
 from src.output_export import create_synergy_chart, export_to_excel, export_to_pdf
 from src.synergy_model import compute_synergy_model
@@ -35,13 +39,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Hide Streamlit's deploy button
 st.markdown(
     "<style>[data-testid='stAppDeployButton'] {display: none;}</style>",
     unsafe_allow_html=True,
 )
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar: settings ─────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("Synergy Calculator")
     st.divider()
@@ -71,12 +74,6 @@ with st.sidebar:
         help="Higher = more accurate CIs but slower.",
     )
 
-    include_bucket_level = st.checkbox(
-        "Include bucket-level synergies",
-        value=False,
-        help="When enabled, also computes synergies across buckets (summed contributions, avg/dominant transformation). Useful when variable-level data is sparse.",
-    )
-
     st.divider()
     st.caption("Estimation: NNLS — no intercept — no seasonality")
     st.caption("Only pairs with a statistically significant positive synergy coefficient are reported.")
@@ -95,10 +92,10 @@ if not success:
     st.error(err_msg)
     st.stop()
 
-weekly           = data.get("weekly", pd.DataFrame())
-wts              = data.get("weekly_transform_support", pd.DataFrame())
-var_meta         = data.get("variable_meta", pd.DataFrame())
-model_dependents = data.get("model_dependents", {})
+weekly           = data.get("weekly",                    pd.DataFrame())
+wts              = data.get("weekly_transform_support",  pd.DataFrame())
+var_meta         = data.get("variable_meta",             pd.DataFrame())
+model_dependents = data.get("model_dependents",          {})
 
 if weekly.empty:
     st.error("Sheet 'Weekly' not found or empty.")
@@ -107,31 +104,28 @@ if wts.empty:
     st.error("Sheet 'WeeklyTransformSupport' not found or empty.")
     st.stop()
 
-# ── Reporting period selector (added to sidebar after data is loaded) ─────────
-reporting_periods = data.get("reporting_periods", [])
-period_start = None
-period_end   = None
+# ── Reporting period selector (sidebar, post-load) ────────────────────────────
+reporting_periods    = data.get("reporting_periods", [])
+period_start         = None
+period_end           = None
 selected_period_name = "Full range"
 
 with st.sidebar:
     st.divider()
     st.subheader("Reporting Period")
     if reporting_periods:
-        period_opts = ["Full range"] + [p["period"] for p in reporting_periods]
+        period_opts          = ["Full range"] + [p["period"] for p in reporting_periods]
         selected_period_name = st.selectbox("Select period", period_opts, key="period_sel")
         if selected_period_name != "Full range":
-            sel_p = next(p for p in reporting_periods if p["period"] == selected_period_name)
+            sel_p        = next(p for p in reporting_periods if p["period"] == selected_period_name)
             period_start = sel_p["start"]
             period_end   = sel_p["end"]
-            st.caption(
-                f"{period_start.strftime('%d %b %Y')}  –  {period_end.strftime('%d %b %Y')}"
-            )
+            st.caption(f"{period_start.strftime('%d %b %Y')}  –  {period_end.strftime('%d %b %Y')}")
     else:
         st.caption("No reporting periods found in Summary sheet — using full date range.")
 
 
 def _clip(s: pd.Series, start, end) -> pd.Series:
-    """Restrict a DatetimeIndex Series to [start, end] inclusive."""
     if start is not None:
         s = s[s.index >= start]
     if end is not None:
@@ -139,180 +133,320 @@ def _clip(s: pd.Series, start, end) -> pd.Series:
     return s
 
 
-# ── Build variable catalogue ──────────────────────────────────────────────────
+# ── Template generation ───────────────────────────────────────────────────────
+
+def _build_classification_lookup(weekly_df: pd.DataFrame) -> dict:
+    """Map (model, variable) -> classification string from the Weekly sheet."""
+    lookup = {}
+    if weekly_df.empty or "classification" not in weekly_df.columns:
+        return lookup
+    sub = weekly_df[["model", "variable", "classification"]].dropna(subset=["classification"])
+    for _, row in sub.iterrows():
+        cls = str(row["classification"]).strip()
+        if cls and cls.lower() not in ("none", "nan", ""):
+            lookup[(str(row["model"]).strip(), str(row["variable"]).strip())] = cls
+    return lookup
+
+
 @st.cache_data(show_spinner=False)
-def _build_catalogue(country: str) -> pd.DataFrame:
-    mv = (
-        weekly[["model", "variable"]]
-        .drop_duplicates()
-        .sort_values(["model", "variable"])
-        .reset_index(drop=True)
-    )
+def generate_selection_template(country: str) -> bytes:
+    """
+    Generate a pre-filled Excel selection template for the given country.
+    Returns raw bytes of the .xlsx file.
+    """
+    buf = io.BytesIO()
+    wb = _xlsxwriter.Workbook(buf, {"in_memory": True})
 
-    # Add classification from weekly sheet if available
-    if "classification" in weekly.columns:
-        classifications = []
-        for _, row in mv.iterrows():
-            classification = get_classification(weekly, row["model"], row["variable"])
-            classifications.append(classification or "—")
-        mv["classification"] = classifications
-    else:
-        mv["classification"] = "—"
+    hdr_fmt  = wb.add_format({"bold": True, "bg_color": "#2E4057", "font_color": "white",
+                               "border": 1, "align": "center", "valign": "vcenter"})
+    body_fmt = wb.add_format({"border": 1, "valign": "vcenter"})
+    note_fmt = wb.add_format({"bold": True, "font_size": 13})
+    text_fmt = wb.add_format({"font_size": 10})
 
+    class_lookup = _build_classification_lookup(weekly)
+
+    # ── Instructions tab ──────────────────────────────────────────────────────
+    ws_instr = wb.add_worksheet("Instructions")
+    ws_instr.write(0, 0, "Synergy Calculation — Selection Template", note_fmt)
+    lines = [
+        "",
+        "HOW TO USE THIS TEMPLATE:",
+        "",
+        "1. Cross-Bucket Synergies tab:",
+        "   Each row represents one (Model, Bucket) combination.",
+        "   Type 'y' in the 'Include in Test' column for every bucket you want to test.",
+        "   All variables in selected buckets will be tested pairwise against variables in",
+        "   OTHER selected buckets within the SAME model. Cross-model pairs are never tested.",
+        "",
+        "2. Intra-Bucket Synergies tab:",
+        "   Each row represents one variable. Type 'y' in 'Include in Test' for variables",
+        "   you want to include. Selected variables will be tested pairwise against other",
+        "   selected variables in the SAME bucket and model.",
+        "",
+        "3. Save the file and upload it back into the app.",
+        "",
+        "NOTE: The 'Grouping' column (Base/Incremental) is a reference label only.",
+        "      It does not control which pairs are tested.",
+    ]
+    for i, line in enumerate(lines):
+        ws_instr.write(i + 1, 0, line, text_fmt)
+    ws_instr.set_column(0, 0, 100)
+
+    # ── Cross-Bucket Synergies tab ────────────────────────────────────────────
+    ws_cross = wb.add_worksheet("Cross-Bucket Synergies")
+    cross_headers = ["Model", "Bucket", "# Variables", "Grouping", "Include in Test"]
+    col_widths_cross = [32, 28, 12, 16, 18]
+    for c_idx, (h, w) in enumerate(zip(cross_headers, col_widths_cross)):
+        ws_cross.write(0, c_idx, h, hdr_fmt)
+        ws_cross.set_column(c_idx, c_idx, w)
+
+    row_idx = 1
     if not var_meta.empty:
-        meta_cols = ["model", "variable", "bucket", "description", "transformation"]
-        available = [c for c in meta_cols if c in var_meta.columns]
-        mv = mv.merge(
-            var_meta[available].drop_duplicates(["model", "variable"]),
-            on=["model", "variable"], how="left",
-        )
-    else:
-        mv["bucket"] = ""
-        mv["description"] = ""
-        mv["transformation"] = ""
+        for (model, bucket), grp in var_meta.groupby(["model", "bucket"], sort=True):
+            model_s  = str(model).strip()
+            bucket_s = str(bucket).strip()
+            if not bucket_s or bucket_s.lower() in ("none", "nan", ""):
+                continue
 
-    def _fmt(t):
-        if not t or pd.isna(t):
-            return "-"
-        info = parse_transformation(str(t))
-        parts = []
-        if info["adstock"] is not None:
-            parts.append(f"Adstock={info['adstock']}, Power={info['power']}, Lag={info['lag']}")
-        if info["rolling_avg"] is not None:
-            parts.append(f"Rolling Avg {info['rolling_avg']}w")
-        return ", ".join(parts) if parts else "-"
+            var_list = grp["variable"].tolist()
+            clsf = [class_lookup.get((model_s, v), "") for v in var_list]
+            clsf = [c for c in clsf if c]
+            if not clsf:
+                grouping = ""
+            elif len(set(clsf)) == 1:
+                grouping = clsf[0]
+            else:
+                grouping = pd.Series(clsf).value_counts().index[0]
 
-    mv["transform_summary"] = mv["transformation"].apply(_fmt)
-    mv.insert(0, "Select", False)
-    return mv
+            ws_cross.write(row_idx, 0, model_s,         body_fmt)
+            ws_cross.write(row_idx, 1, bucket_s,        body_fmt)
+            ws_cross.write(row_idx, 2, len(grp),        body_fmt)
+            ws_cross.write(row_idx, 3, grouping,        body_fmt)
+            ws_cross.write(row_idx, 4, "",              body_fmt)
+            row_idx += 1
+
+    # ── Intra-Bucket Synergies tab ────────────────────────────────────────────
+    ws_intra = wb.add_worksheet("Intra-Bucket Synergies")
+    intra_headers = ["Model", "Bucket", "Variable", "Description", "Grouping", "Include in Test"]
+    col_widths_intra = [32, 28, 28, 44, 16, 18]
+    for c_idx, (h, w) in enumerate(zip(intra_headers, col_widths_intra)):
+        ws_intra.write(0, c_idx, h, hdr_fmt)
+        ws_intra.set_column(c_idx, c_idx, w)
+
+    row_idx = 1
+    if not var_meta.empty:
+        for _, row in var_meta.sort_values(["model", "bucket", "variable"]).iterrows():
+            model_s  = str(row["model"]).strip()
+            bucket_s = str(row.get("bucket", "") or "").strip()
+            var_s    = str(row["variable"]).strip()
+            desc_s   = str(row.get("description", "") or "").strip()
+            if not bucket_s or bucket_s.lower() in ("none", "nan", ""):
+                continue
+            grouping = class_lookup.get((model_s, var_s), "")
+            ws_intra.write(row_idx, 0, model_s,  body_fmt)
+            ws_intra.write(row_idx, 1, bucket_s, body_fmt)
+            ws_intra.write(row_idx, 2, var_s,    body_fmt)
+            ws_intra.write(row_idx, 3, desc_s,   body_fmt)
+            ws_intra.write(row_idx, 4, grouping, body_fmt)
+            ws_intra.write(row_idx, 5, "",       body_fmt)
+            row_idx += 1
+
+    wb.close()
+    buf.seek(0)
+    return buf.read()
 
 
-catalogue = _build_catalogue(selected_country)
+# ── Template parsing ──────────────────────────────────────────────────────────
+
+def parse_selection_template(uploaded_file) -> tuple:
+    """
+    Parse an uploaded selection template.
+
+    Returns (cross_bucket_selections, intra_var_selections, error_str_or_None)
+      cross_bucket_selections : list of (model, bucket)
+      intra_var_selections    : dict of {(model, bucket): [var, ...]}
+    """
+    try:
+        xl = pd.ExcelFile(uploaded_file, engine="openpyxl")
+    except Exception as exc:
+        return [], {}, f"Could not read uploaded file: {exc}"
+
+    cross_selections = []
+    intra_selections: dict = defaultdict(list)
+
+    # Cross-Bucket tab
+    if "Cross-Bucket Synergies" in xl.sheet_names:
+        try:
+            df = xl.parse("Cross-Bucket Synergies", dtype=str)
+            df.columns = [str(c).strip() for c in df.columns]
+            needed = {"Model", "Bucket", "Include in Test"}
+            if needed.issubset(set(df.columns)):
+                for _, row in df.iterrows():
+                    val = str(row.get("Include in Test", "") or "").strip().lower()
+                    if val == "y":
+                        model  = str(row["Model"] or "").strip()
+                        bucket = str(row["Bucket"] or "").strip()
+                        if model and bucket and model.lower() not in ("nan", "none"):
+                            cross_selections.append((model, bucket))
+        except Exception as exc:
+            return [], {}, f"Error reading 'Cross-Bucket Synergies' tab: {exc}"
+
+    # Intra-Bucket tab
+    if "Intra-Bucket Synergies" in xl.sheet_names:
+        try:
+            df = xl.parse("Intra-Bucket Synergies", dtype=str)
+            df.columns = [str(c).strip() for c in df.columns]
+            needed = {"Model", "Variable", "Include in Test"}
+            if needed.issubset(set(df.columns)):
+                for _, row in df.iterrows():
+                    val = str(row.get("Include in Test", "") or "").strip().lower()
+                    if val == "y":
+                        model  = str(row["Model"]    or "").strip()
+                        bucket = str(row.get("Bucket", "") or "").strip()
+                        var    = str(row["Variable"] or "").strip()
+                        if model and var and model.lower() not in ("nan", "none"):
+                            intra_selections[(model, bucket)].append(var)
+        except Exception as exc:
+            return [], {}, f"Error reading 'Intra-Bucket Synergies' tab: {exc}"
+
+    return cross_selections, dict(intra_selections), None
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
 st.header(f"Synergy Analysis — {selected_country}")
 st.divider()
 
-# ── Step 1: Variable selection ────────────────────────────────────────────────
-st.subheader("1  Select Variables")
+# ── Step 1: Template download + upload ───────────────────────────────────────
+st.subheader("1  Select Pairs via Template")
 st.markdown(
-    "Tick **Select** for each variable to include. "
-    "All unique pairs will be tested — only those with a statistically significant "
-    "positive synergy coefficient will be shown in the results."
+    "Download the pre-filled template below, mark **y** in the *Include in Test* column "
+    "for the buckets and variables you want, then upload the completed file."
 )
 
-fcol1, fcol2, fcol3, fcol4 = st.columns([2, 2, 2, 3])
-with fcol1:
-    all_models = ["All"] + sorted(catalogue["model"].unique().tolist())
-    filter_model = st.selectbox("Filter by Model", all_models)
-with fcol2:
-    all_buckets = ["All"] + sorted(
-        b for b in catalogue["bucket"].dropna().unique() if b
+dl_col, _, info_col = st.columns([2, 1, 3])
+with dl_col:
+    template_bytes = generate_selection_template(selected_country)
+    now_str = datetime.now().strftime("%H%M")
+    st.download_button(
+        label="📥 Download Selection Template",
+        data=template_bytes,
+        file_name=f"synergy_template_{selected_country}_{now_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="dl_template",
     )
-    filter_bucket = st.selectbox("Filter by Bucket", all_buckets)
-with fcol3:
-    all_classifications = ["All"] + sorted(
-        c for c in catalogue["classification"].dropna().unique() if c and c != "—"
+with info_col:
+    st.caption(
+        "Tab 1 — **Cross-Bucket Synergies**: select buckets. "
+        "Variables across different selected buckets (same model) will be tested. "
+        "Tab 2 — **Intra-Bucket Synergies**: select individual variables within a bucket."
     )
-    filter_classification = st.selectbox("Filter by Classification", all_classifications)
-with fcol4:
-    search_text = st.text_input("Search variable / description", placeholder="Type to filter…")
 
-display_df = catalogue.copy()
-if filter_model != "All":
-    display_df = display_df[display_df["model"] == filter_model]
-if filter_bucket != "All":
-    display_df = display_df[display_df["bucket"] == filter_bucket]
-if filter_classification != "All":
-    display_df = display_df[display_df["classification"] == filter_classification]
-if search_text:
-    mask = (
-        display_df["variable"].str.contains(search_text, case=False, na=False)
-        | display_df.get("description", pd.Series("", index=display_df.index))
-          .str.contains(search_text, case=False, na=False)
-    )
-    display_df = display_df[mask]
-
-# Initialize selection state in session
-if "var_selection" not in st.session_state:
-    st.session_state.var_selection = {}
-
-show_cols = ["Select", "model", "variable", "description", "bucket", "classification", "transform_summary"]
-show_cols = [c for c in show_cols if c in display_df.columns]
-
-# Update display_df with current selections from session state
-for idx, row in display_df.iterrows():
-    var_key = (row["model"], row["variable"])
-    display_df.loc[idx, "Select"] = st.session_state.var_selection.get(var_key, False)
-
-# Quick action buttons
-btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
-with btn_col1:
-    if st.button("✓ Select All", use_container_width=True):
-        for idx, row in catalogue.iterrows():
-            var_key = (row["model"], row["variable"])
-            st.session_state.var_selection[var_key] = True
-        st.rerun()
-
-with btn_col2:
-    if st.button("✗ Deselect All", use_container_width=True):
-        st.session_state.var_selection.clear()
-        st.rerun()
-
-if search_text or filter_model != "All" or filter_bucket != "All" or filter_classification != "All":
-    filtered_count = len(display_df)
-    with btn_col3:
-        if st.button(f"✓ Select Filtered ({filtered_count})", use_container_width=True):
-            for idx, row in display_df.iterrows():
-                var_key = (row["model"], row["variable"])
-                st.session_state.var_selection[var_key] = True
-            st.rerun()
-
-    with btn_col4:
-        if st.button(f"✗ Deselect Filtered ({filtered_count})", use_container_width=True):
-            for idx, row in display_df.iterrows():
-                var_key = (row["model"], row["variable"])
-                st.session_state.var_selection[var_key] = False
-            st.rerun()
-
-edited = st.data_editor(
-    display_df[show_cols].reset_index(drop=True),
-    use_container_width=True,
-    hide_index=True,
-    height=380,
-    column_config={
-        "Select":            st.column_config.CheckboxColumn("Select",       width="small"),
-        "model":             st.column_config.TextColumn("Model",            width="medium"),
-        "variable":          st.column_config.TextColumn("Variable",         width="medium"),
-        "description":       st.column_config.TextColumn("Description",      width="large"),
-        "bucket":            st.column_config.TextColumn("Bucket",           width="medium"),
-        "classification":    st.column_config.TextColumn("Classification",   width="small"),
-        "transform_summary": st.column_config.TextColumn("Transformation",   width="large"),
-    },
-    disabled=["model", "variable", "description", "bucket", "classification", "transform_summary"],
-    key=f"var_table_{selected_country}",
+uploaded_template = st.file_uploader(
+    "Upload completed template",
+    type=["xlsx"],
+    key=f"template_upload_{selected_country}",
+    help="Upload the filled-in template to define which pairs to test.",
 )
 
-# Sync selections from data_editor back to session state
-for idx, row in display_df.iterrows():
-    var_key = (row["model"], row["variable"])
-    if idx < len(edited):
-        st.session_state.var_selection[var_key] = bool(edited.iloc[idx]["Select"])
+# Parse on upload, cache result in session_state keyed by (name, size, country)
+cross_bucket_selections: list = []
+intra_var_selections: dict    = {}
+template_error = None
 
-selected_rows = edited[edited["Select"] == True]
-n_sel = len(selected_rows)
+if uploaded_template is not None:
+    file_id = (uploaded_template.name, uploaded_template.size, selected_country)
+    if st.session_state.get("_tpl_file_id") != file_id:
+        c_sel, i_sel, t_err = parse_selection_template(uploaded_template)
+        st.session_state["_tpl_file_id"]    = file_id
+        st.session_state["_tpl_cross"]      = c_sel
+        st.session_state["_tpl_intra"]      = i_sel
+        st.session_state["_tpl_error"]      = t_err
 
-if n_sel >= 2:
-    n_pairs = n_sel * (n_sel - 1) // 2
-    st.success(
-        f"**{n_sel}** variables selected → **{n_pairs}** pair{'s' if n_pairs != 1 else ''} "
-        "will be tested. Only significant synergies will be shown."
-    )
-elif n_sel == 1:
-    st.warning("Select at least **2** variables.")
+    cross_bucket_selections = st.session_state.get("_tpl_cross", [])
+    intra_var_selections    = st.session_state.get("_tpl_intra", {})
+    template_error          = st.session_state.get("_tpl_error")
+
+    if template_error:
+        st.error(f"Template error: {template_error}")
+    else:
+        # ── Preview ──────────────────────────────────────────────────────────
+        total_cross_pairs = 0
+        total_intra_pairs = 0
+
+        # Group cross-bucket by model
+        model_to_cross_buckets: dict = defaultdict(list)
+        for model, bucket in cross_bucket_selections:
+            model_to_cross_buckets[model].append(bucket)
+
+        # Intra by model
+        model_to_intra: dict = defaultdict(dict)
+        for (model, bucket), vars_list in intra_var_selections.items():
+            model_to_intra[model][(model, bucket)] = vars_list
+
+        all_preview_models = sorted(
+            set(list(model_to_cross_buckets.keys()) + list(model_to_intra.keys()))
+        )
+
+        if not all_preview_models:
+            st.warning("No pairs selected. Mark at least one bucket or variable with 'y' in the template.")
+        else:
+            st.markdown("**Preview — pairs to be tested:**")
+            for model in all_preview_models:
+                cross_buckets = model_to_cross_buckets.get(model, [])
+                intra_entries = {
+                    k: v for k, v in intra_var_selections.items() if k[0] == model
+                }
+
+                # Count cross pairs for this model
+                model_cross_pairs = 0
+                for b1, b2 in combinations(cross_buckets, 2):
+                    if not var_meta.empty:
+                        n1 = len(var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b1)])
+                        n2 = len(var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b2)])
+                        model_cross_pairs += n1 * n2
+
+                # Count intra pairs for this model
+                model_intra_pairs = sum(
+                    len(vl) * (len(vl) - 1) // 2
+                    for vl in intra_entries.values()
+                    if len(vl) >= 2
+                )
+
+                total_cross_pairs += model_cross_pairs
+                total_intra_pairs += model_intra_pairs
+
+                parts = []
+                if model_cross_pairs:
+                    parts.append(f"{model_cross_pairs} cross-bucket pair{'s' if model_cross_pairs != 1 else ''}")
+                if model_intra_pairs:
+                    parts.append(f"{model_intra_pairs} intra-bucket pair{'s' if model_intra_pairs != 1 else ''}")
+                summary_str = " + ".join(parts) if parts else "0 pairs"
+
+                with st.expander(f"**{model}** — {summary_str}", expanded=False):
+                    if cross_buckets:
+                        st.markdown("*Cross-bucket buckets selected:*")
+                        for b in sorted(cross_buckets):
+                            if not var_meta.empty:
+                                n = len(var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b)])
+                            else:
+                                n = 0
+                            st.markdown(f"  - **{b}** ({n} variable{'s' if n != 1 else ''})")
+                    if intra_entries:
+                        st.markdown("*Intra-bucket variables selected:*")
+                        for (m, bkt), vlist in intra_entries.items():
+                            st.markdown(f"  - **{bkt}**: {', '.join(vlist)}")
+
+            total_pairs = total_cross_pairs + total_intra_pairs
+            if total_pairs > 0:
+                st.success(
+                    f"**{total_pairs}** total pair{'s' if total_pairs != 1 else ''} to test "
+                    f"({total_cross_pairs} cross-bucket, {total_intra_pairs} intra-bucket)."
+                )
 else:
-    st.info("Use the table above to select variables.")
+    # Clear stale template state when file is removed
+    for _k in ("_tpl_file_id", "_tpl_cross", "_tpl_intra", "_tpl_error"):
+        st.session_state.pop(_k, None)
 
 st.divider()
 
@@ -320,104 +454,111 @@ st.divider()
 # ── Step 2: Run ───────────────────────────────────────────────────────────────
 st.subheader("2  Run Analysis")
 
-if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
-    # Recover (model, variable, description) tuples
-    sel_mv = []
-    for _, row in selected_rows.iterrows():
-        match = catalogue[
-            (catalogue["variable"] == row["variable"]) &
-            (catalogue["model"]    == row["model"])
-        ]
-        if not match.empty:
-            r = match.iloc[0]
-            sel_mv.append((r["model"], r["variable"], r.get("description", "") or "", r.get("bucket", "") or ""))
+_total_pairs_preview = (
+    sum(
+        len(v) * (len(v) - 1) // 2
+        for v in intra_var_selections.values()
+        if len(v) >= 2
+    ) + sum(
+        len(var_meta[(var_meta["model"] == m) & (var_meta["bucket"] == b1)]) *
+        len(var_meta[(var_meta["model"] == m) & (var_meta["bucket"] == b2)])
+        for m, buckets in (
+            {mdl: [bkt for _m, bkt in cross_bucket_selections if _m == mdl]
+             for mdl in {_m for _m, _ in cross_bucket_selections}}.items()
+        )
+        for b1, b2 in combinations(buckets, 2)
+    )
+    if not var_meta.empty and cross_bucket_selections else 0
+)
+can_run = _total_pairs_preview > 0 or any(
+    len(v) >= 2 for v in intra_var_selections.values()
+)
 
-    # Build pairs: variable-level first, then bucket-level if enabled
-    pairs = []
-    pair_types = []  # track whether each pair is "variable" or "bucket"
+if not can_run and uploaded_template is None:
+    st.info("Upload a completed template above to enable the analysis.")
+elif not can_run:
+    st.warning("No valid pairs found in the uploaded template. Check your selections.")
 
-    # Variable-level pairs
-    variable_pairs = list(combinations(sel_mv, 2))
-    for (m1, v1, d1, b1), (m2, v2, d2, b2) in variable_pairs:
-        pairs.append(((m1, v1, d1), (m2, v2, d2)))
-        pair_types.append("variable")
-
-    # Bucket-level pairs (if enabled)
-    if include_bucket_level:
-        # Get unique (model, bucket) combinations from selected variables
-        # Filter out variables without buckets (empty strings, None, or NaN)
-        valid_buckets = []
-        excluded_vars = []
-        for m, v, d, b in sel_mv:
-            # Check if bucket is valid (not empty, None, or NaN)
-            if b and isinstance(b, str) and b.strip():
-                valid_buckets.append((m, b))
-            else:
-                var_label = f"{v}" + (f" — {d}" if d else "")
-                excluded_vars.append(var_label)
-
-        if excluded_vars:
-            var_list = "\n".join(f"• {var}" for var in sorted(set(excluded_vars)))
-            st.info(
-                f"⚠️ **Bucket-level analysis**: The following {len(excluded_vars)} variables don't have bucket assignments and will be excluded from bucket-level synergy calculations:\n\n{var_list}"
-            )
-
-        bucket_set = set(valid_buckets)
-        bucket_list = list(bucket_set)
-        bucket_pairs = list(combinations(bucket_list, 2))
-
-        for (m1, b1), (m2, b2) in bucket_pairs:
-            pairs.append(((m1, b1, b1), (m2, b2, b2)))  # Use bucket name as description
-            pair_types.append("bucket")
-
-    all_results = []
-    prog = st.progress(0, text="Starting…")
-
-    # Cache total contributions per model to avoid recomputing
+if st.button("Run Synergy Analysis", type="primary", disabled=not can_run):
+    all_results: list   = []
+    prog                = st.progress(0, text="Starting…")
     total_y_cache: dict = {}
 
-    for pair_idx, (pair_data, pair_type) in enumerate(zip(pairs, pair_types)):
-        (m1, id1, desc1), (m2, id2, desc2) = pair_data
+    # ── Build all pairs ───────────────────────────────────────────────────────
+    pairs = []  # ((m1,v1,d1,bkt1), (m2,v2,d2,bkt2), pair_type)
+
+    # Cross-bucket pairs — grouped by model, same model only
+    if cross_bucket_selections and not var_meta.empty:
+        model_to_buckets: dict = defaultdict(list)
+        for model, bucket in cross_bucket_selections:
+            model_to_buckets[model].append(bucket)
+
+        for model, buckets in model_to_buckets.items():
+            for b1, b2 in combinations(buckets, 2):
+                vars1 = var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b1)]
+                vars2 = var_meta[(var_meta["model"] == model) & (var_meta["bucket"] == b2)]
+                for _, r1 in vars1.iterrows():
+                    for _, r2 in vars2.iterrows():
+                        pairs.append((
+                            (model, r1["variable"],
+                             str(r1.get("description", "") or "").strip(), b1),
+                            (model, r2["variable"],
+                             str(r2.get("description", "") or "").strip(), b2),
+                            "cross_bucket",
+                        ))
+
+    # Intra-bucket pairs
+    if intra_var_selections:
+        # Build a description lookup from var_meta
+        desc_lookup = {}
+        bkt_lookup  = {}
+        if not var_meta.empty:
+            for _, row in var_meta.iterrows():
+                key = (str(row["model"]).strip(), str(row["variable"]).strip())
+                desc_lookup[key] = str(row.get("description", "") or "").strip()
+                bkt_lookup[key]  = str(row.get("bucket", "")      or "").strip()
+
+        for (model, bucket), vars_list in intra_var_selections.items():
+            if len(vars_list) < 2:
+                continue
+            for v1, v2 in combinations(vars_list, 2):
+                d1 = desc_lookup.get((model, v1), "")
+                d2 = desc_lookup.get((model, v2), "")
+                b1 = bkt_lookup.get((model, v1), bucket)
+                b2 = bkt_lookup.get((model, v2), bucket)
+                pairs.append((
+                    (model, v1, d1, b1),
+                    (model, v2, d2, b2),
+                    "intra_bucket",
+                ))
+
+    # ── Run each pair ─────────────────────────────────────────────────────────
+    for pair_idx, ((m1, id1, desc1, bkt1), (m2, id2, desc2, bkt2), pair_type) in enumerate(pairs):
         prog.progress(
-            (pair_idx + 1) / len(pairs),
-            text=f"Pair {pair_idx+1}/{len(pairs)}: {id1} x {id2} ({pair_type})",
+            (pair_idx + 1) / max(len(pairs), 1),
+            text=f"Pair {pair_idx+1}/{len(pairs)}: {id1} × {id2} ({pair_type})",
         )
 
-        # Get time series based on pair type
-        if pair_type == "variable":
-            v1, v2 = id1, id2
-            ts1 = _clip(get_series(wts, m1, v1), period_start, period_end)
-            ts2 = _clip(get_series(wts, m2, v2), period_start, period_end)
-            orig1_s = _clip(get_series(weekly, m1, v1), period_start, period_end)
-            orig2_s = _clip(get_series(weekly, m2, v2), period_start, period_end)
-        else:  # bucket level
-            b1, b2 = id1, id2
-            ts1, _ = get_bucket_series(wts, m1, b1, var_meta)
-            ts2, _ = get_bucket_series(wts, m2, b2, var_meta)
-            orig1_s, _ = get_bucket_series(weekly, m1, b1, var_meta)
-            orig2_s, _ = get_bucket_series(weekly, m2, b2, var_meta)
-            ts1 = _clip(ts1, period_start, period_end)
-            ts2 = _clip(ts2, period_start, period_end)
-            orig1_s = _clip(orig1_s, period_start, period_end)
-            orig2_s = _clip(orig2_s, period_start, period_end)
+        ts1     = _clip(get_series(wts,    m1, id1), period_start, period_end)
+        ts2     = _clip(get_series(wts,    m2, id2), period_start, period_end)
+        orig1_s = _clip(get_series(weekly, m1, id1), period_start, period_end)
+        orig2_s = _clip(get_series(weekly, m2, id2), period_start, period_end)
 
-        # Check for missing data
-        # Check for missing data
         missing = []
         if ts1.empty: missing.append(f"support for '{id1}' in WeeklyTransformSupport")
         if ts2.empty: missing.append(f"support for '{id2}' in WeeklyTransformSupport")
         if missing:
             all_results.append({
                 "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
+                "bucket1": bkt1, "bucket2": bkt2,
                 "model1": m1, "model2": m2, "pair_type": pair_type,
                 "error": "Missing data: " + "; ".join(missing),
                 "is_significant": False,
             })
             continue
 
-        # Use total model contributions of model1 as Y (if cross-model pair, use m1)
         if m1 not in total_y_cache:
-            dep_var = model_dependents.get(m1)   # exclude dependent to avoid double-count
+            dep_var = model_dependents.get(m1)
             total_y_cache[m1] = _clip(
                 get_total_model_contributions(weekly, m1, dependent_var=dep_var),
                 period_start, period_end,
@@ -427,6 +568,7 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
         if total_y.empty or total_y.std() < 1e-6:
             all_results.append({
                 "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
+                "bucket1": bkt1, "bucket2": bkt2,
                 "model1": m1, "model2": m2, "pair_type": pair_type,
                 "error": f"No usable total contributions found for model '{m1}'.",
                 "is_significant": False,
@@ -434,29 +576,22 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
             continue
 
         res = compute_synergy_model(total_y, ts1, ts2, ci_level, n_bootstrap)
-        res.update({"var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
-                    "model1": m1, "model2": m2, "pair_type": pair_type})
+        res.update({
+            "var1": id1, "var2": id2, "desc1": desc1, "desc2": desc2,
+            "bucket1": bkt1, "bucket2": bkt2,
+            "model1": m1, "model2": m2, "pair_type": pair_type,
+        })
+
         if not res.get("error"):
-            # Original contributions aligned to the synergy analysis period
-            idx = res["index"]
+            idx     = res["index"]
             orig_c1 = float(orig1_s.reindex(idx).fillna(0).sum())
             orig_c2 = float(orig2_s.reindex(idx).fillna(0).sum())
             res["orig_contrib1"] = orig_c1
             res["orig_contrib2"] = orig_c2
 
-            # Scale synergy model outputs to original contribution space.
-            # The NNLS regresses *total* model Y on just 2 variables, so raw
-            # coefficients × support are inflated (they try to explain the whole
-            # total, not just A/B's slice).  Fix: use the relative proportions
-            # that the model assigns to each component (A, B, synergy) and apply
-            # those proportions to the original combined MMM contribution (C1+C2).
-            # This guarantees adj_A + adj_B + synergy = C1 + C2 and keeps all
-            # five rows on the same contribution scale.
-            c = res["coefficients"]
+            c       = res["coefficients"]
             raw_A   = float(np.sum(res["support1"]        * c[0]))
             raw_B   = float(np.sum(res["support2"]        * c[1]))
-            # Clip to zero: negative sum would mean variables are net out-of-phase
-            # (already gated in is_significant, but clip here as a safety net)
             raw_syn = max(0.0, float(np.sum(res["synergy_support"] * c[2])))
             raw_tot = raw_A + raw_B + raw_syn
             combined = orig_c1 + orig_c2
@@ -468,12 +603,13 @@ if st.button("Run Synergy Analysis", type="primary", disabled=n_sel < 2):
                 res["adj_contrib1"]    = orig_c1
                 res["adj_contrib2"]    = orig_c2
                 res["synergy_contrib"] = 0.0
+
         all_results.append(res)
 
     prog.empty()
-    st.session_state["all_results"]      = all_results
-    st.session_state["result_country"]   = selected_country
-    st.session_state["result_period"]    = selected_period_name
+    st.session_state["all_results"]    = all_results
+    st.session_state["result_country"] = selected_country
+    st.session_state["result_period"]  = selected_period_name
 
 st.divider()
 
@@ -482,9 +618,9 @@ st.divider()
 if (
     "all_results" in st.session_state
     and st.session_state.get("result_country") == selected_country
-    and st.session_state.get("result_period") == selected_period_name
+    and st.session_state.get("result_period")  == selected_period_name
 ):
-    all_results = st.session_state["all_results"]
+    all_results  = st.session_state["all_results"]
     significant  = [r for r in all_results if r.get("is_significant")]
     tested_count = len(all_results)
     error_count  = sum(1 for r in all_results if r.get("error"))
@@ -492,35 +628,35 @@ if (
     result_period = st.session_state.get("result_period", "Full range")
     st.subheader(f"3  Results  —  {result_period}")
 
-    # Summary banner
     bcol1, bcol2, bcol3 = st.columns(3)
-    bcol1.metric("Pairs Tested",        tested_count - error_count)
-    bcol2.metric("Synergies Found",      len(significant))
-    bcol3.metric("Errors / Skipped",     error_count)
+    bcol1.metric("Pairs Tested",     tested_count - error_count)
+    bcol2.metric("Synergies Found",  len(significant))
+    bcol3.metric("Errors / Skipped", error_count)
 
     if not significant:
         st.info(
-            "No statistically significant synergies were found in the selected pairs. "
-            "Try selecting different variables or lowering the confidence interval threshold."
+            "No statistically significant synergies were found. "
+            "Try selecting different buckets or lowering the confidence interval threshold."
         )
     else:
-        significant = sorted(significant, key=lambda r: r.get("delta_r2", 0), reverse=True)
-        ci_pct = int(ci_level * 100)
+        significant     = sorted(significant, key=lambda r: r.get("delta_r2", 0), reverse=True)
+        ci_pct          = int(ci_level * 100)
+        cross_synergies = [r for r in significant if r.get("pair_type") == "cross_bucket"]
+        intra_synergies = [r for r in significant if r.get("pair_type") == "intra_bucket"]
 
-        # Split results by pair type
-        var_synergies = [r for r in significant if r.get("pair_type") != "bucket"]
-        bucket_synergies = [r for r in significant if r.get("pair_type") == "bucket"]
+        # ── Label helper ──────────────────────────────────────────────────────
+        def _var_label(var: str, desc: str, bucket: str) -> str:
+            detail = var + (f" | {bucket}" if bucket else "")
+            return f"{desc} ({detail})" if desc else var + (f" | {bucket}" if bucket else "")
 
-        # ── VARIABLE-LEVEL SYNERGIES ──────────────────────────────────────────
-        if var_synergies:
-            st.markdown("#### Variable-Level Synergies")
-
+        # ── Summary table ─────────────────────────────────────────────────────
+        def _render_summary_table(res_list: list, anchor_prefix: str, hdr_color: str) -> None:
             rows_html = ""
-            for idx, res in enumerate(var_synergies):
-                anchor   = f"synergy-pair-var-{idx}"
-                d1 = res.get("desc1") or res["var1"]
-                d2 = res.get("desc2") or res["var2"]
-                pair_lbl = f"{d1} x {d2}"
+            for idx, res in enumerate(res_list):
+                anchor    = f"{anchor_prefix}-{idx}"
+                lbl1      = _var_label(res["var1"], res.get("desc1", ""), res.get("bucket1", ""))
+                lbl2      = _var_label(res["var2"], res.get("desc2", ""), res.get("bucket2", ""))
+                pair_lbl  = f"{lbl1}  ×  {lbl2}"
                 model_lbl = (
                     res["model1"] if res["model1"] == res["model2"]
                     else f"{res['model1']} / {res['model2']}"
@@ -531,21 +667,20 @@ if (
                     f"<td style='padding:6px 12px'><a href='#{anchor}'>{pair_lbl}</a></td>"
                     f"<td style='padding:6px 12px'>{model_lbl}</td>"
                     f"<td style='padding:6px 12px'>{res.get('delta_r2', 0):.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('r2_full', 0):.4f}</td>"
+                    f"<td style='padding:6px 12px'>{res.get('r2_full',  0):.4f}</td>"
                     f"<td style='padding:6px 12px'>{res['coefficients'][2]:.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('f_stat', 0):.2f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('p_value', 1):.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('synergy_formulation','')}</td>"
+                    f"<td style='padding:6px 12px'>{res.get('f_stat',   0):.2f}</td>"
+                    f"<td style='padding:6px 12px'>{res.get('p_value',  1):.4f}</td>"
+                    f"<td style='padding:6px 12px'>{res.get('synergy_formulation', '')}</td>"
                     f"</tr>"
                 )
-
             st.markdown(
                 f"""
                 <table style='border-collapse:collapse; width:100%; font-size:0.88rem'>
                   <thead>
-                    <tr style='background:#2E4057; color:white'>
+                    <tr style='background:{hdr_color}; color:white'>
                       <th style='padding:6px 12px'>#</th>
-                      <th style='padding:6px 12px'>Pair</th>
+                      <th style='padding:6px 12px'>Pair (Variable | Bucket)</th>
                       <th style='padding:6px 12px'>Model</th>
                       <th style='padding:6px 12px'>Delta R²</th>
                       <th style='padding:6px 12px'>R² (full)</th>
@@ -561,99 +696,29 @@ if (
                 unsafe_allow_html=True,
             )
 
-            st.divider()
-
-        # ── BUCKET-LEVEL SYNERGIES ────────────────────────────────────────────
-        if bucket_synergies:
-            st.markdown("#### Bucket-Level Synergies")
-
-            rows_html = ""
-            for idx, res in enumerate(bucket_synergies):
-                anchor   = f"synergy-pair-bucket-{idx}"
-                d1 = res.get("desc1") or res["var1"]
-                d2 = res.get("desc2") or res["var2"]
-                pair_lbl = f"{d1} x {d2}"
-                model_lbl = (
-                    res["model1"] if res["model1"] == res["model2"]
-                    else f"{res['model1']} / {res['model2']}"
-                )
-                rows_html += (
-                    f"<tr>"
-                    f"<td style='padding:6px 12px'>{idx+1}</td>"
-                    f"<td style='padding:6px 12px'><a href='#{anchor}'>{pair_lbl}</a></td>"
-                    f"<td style='padding:6px 12px'>{model_lbl}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('delta_r2', 0):.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('r2_full', 0):.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res['coefficients'][2]:.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('f_stat', 0):.2f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('p_value', 1):.4f}</td>"
-                    f"<td style='padding:6px 12px'>{res.get('synergy_formulation','')}</td>"
-                    f"</tr>"
-                )
-
-            st.markdown(
-                f"""
-                <table style='border-collapse:collapse; width:100%; font-size:0.88rem'>
-                  <thead>
-                    <tr style='background:#8B6F47; color:white'>
-                      <th style='padding:6px 12px'>#</th>
-                      <th style='padding:6px 12px'>Pair</th>
-                      <th style='padding:6px 12px'>Model</th>
-                      <th style='padding:6px 12px'>Delta R²</th>
-                      <th style='padding:6px 12px'>R² (full)</th>
-                      <th style='padding:6px 12px'>Synergy Coeff</th>
-                      <th style='padding:6px 12px'>F-stat</th>
-                      <th style='padding:6px 12px'>p-value</th>
-                      <th style='padding:6px 12px'>Formulation</th>
-                    </tr>
-                  </thead>
-                  <tbody>{rows_html}</tbody>
-                </table>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            st.divider()
-
-        # Initialize export selection state
-        if "export_selection" not in st.session_state:
-            st.session_state.export_selection = {}
-
-        # ── Detail panels: Variable-Level ────────────────────────────────────────
-        if var_synergies:
-            st.markdown("### Variable-Level Details")
-            for idx, res in enumerate(var_synergies):
-                anchor = f"synergy-pair-var-{idx}"
-                d1 = res.get("desc1") or res["var1"]
-                d2 = res.get("desc2") or res["var2"]
-                title  = f"{d1}  x  {d2}"
-                subtitle = (
-                    f"({res['model1']})"
-                    if res["model1"] == res["model2"]
+        # ── Detail panels ─────────────────────────────────────────────────────
+        def _render_detail_panels(res_list: list, anchor_prefix: str) -> None:
+            for idx, res in enumerate(res_list):
+                anchor     = f"{anchor_prefix}-{idx}"
+                lbl1       = _var_label(res["var1"], res.get("desc1", ""), res.get("bucket1", ""))
+                lbl2       = _var_label(res["var2"], res.get("desc2", ""), res.get("bucket2", ""))
+                title      = f"{lbl1}  ×  {lbl2}"
+                subtitle   = (
+                    f"({res['model1']})" if res["model1"] == res["model2"]
                     else f"({res['model1']} / {res['model2']})"
                 )
-
-                # Inject anchor so the summary table links land here
-                st.markdown(f"<div id='{anchor}'></div>", unsafe_allow_html=True)
-
-                # Create unique key for this result (stable, not dependent on sort order)
                 result_key = f"{res['model1']}_{res['var1']}_{res['model2']}_{res['var2']}"
 
-                # Create expander with export checkbox
-                exp_col1, exp_col2 = st.columns([0.85, 0.15])
-                with exp_col1:
-                    expander = st.expander(f"{idx+1}.  {title}   {subtitle}", expanded=False)
-                with exp_col2:
-                    is_selected = st.checkbox(
-                        "Export",
-                        value=st.session_state.export_selection.get(result_key, False),
-                        key=f"export_checkbox_{result_key}",
-                        label_visibility="collapsed",
+                st.markdown(f"<div id='{anchor}'></div>", unsafe_allow_html=True)
+                with st.expander(f"{idx+1}.  {title}   {subtitle}", expanded=False):
+                    b1 = res.get("bucket1", "")
+                    b2 = res.get("bucket2", "")
+                    st.caption(
+                        f"**{res['var1']}** (Bucket: {b1})  ×  **{res['var2']}** (Bucket: {b2})"
+                        f"  |  Formulation: {res['synergy_formulation']}"
+                        f"  |  N = {res['n_obs']}  |  CI = {ci_pct}%"
                     )
-                    st.session_state.export_selection[result_key] = is_selected
 
-                with expander:
-                    # ── Key metrics ───────────────────────────────────────────────
                     mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
                     mc1.metric("R² Base",         f"{res['r2_base']:.4f}")
                     mc2.metric("R² with Synergy", f"{res['r2_full']:.4f}")
@@ -662,15 +727,7 @@ if (
                     mc5.metric("F-stat",           f"{res['f_stat']:.2f}")
                     mc6.metric("p-value",          f"{res['p_value']:.4f}")
 
-                    st.caption(
-                        f"**{res['var1']}** | **{res['var2']}**  "
-                        f"|  Formulation: {res['synergy_formulation']}  "
-                        f"|  N = {res['n_obs']}  |  CI = {ci_pct}%"
-                    )
-
-                    # ── CI table ──────────────────────────────────────────────────
-                    lbl1 = f"{d1} ({res['var1']})"
-                    lbl2 = f"{d2} ({res['var2']})"
+                    # CI table
                     ci_df = pd.DataFrame({
                         "Variable":              [lbl1, lbl2, "Synergy"],
                         "Coefficient":           res["coefficients"],
@@ -679,290 +736,202 @@ if (
                     }).set_index("Variable")
                     st.dataframe(ci_df.style.format("{:.6f}"), use_container_width=True)
 
-                    # ── Contribution breakdown ────────────────────────────────────
+                    # Contribution breakdown
                     st.markdown("**Contribution Breakdown** — sum over analysis period")
-                    orig_c1  = res.get("orig_contrib1",  0.0)
-                    orig_c2  = res.get("orig_contrib2",  0.0)
-                    adj_c1   = res.get("adj_contrib1",   orig_c1)
-                    adj_c2   = res.get("adj_contrib2",   orig_c2)
-                    syn_cab  = res.get("synergy_contrib", 0.0)
+                    orig_c1 = res.get("orig_contrib1",  0.0)
+                    orig_c2 = res.get("orig_contrib2",  0.0)
+                    adj_c1  = res.get("adj_contrib1",   orig_c1)
+                    adj_c2  = res.get("adj_contrib2",   orig_c2)
+                    syn_cab = res.get("synergy_contrib", 0.0)
 
-                    # Calculate adjustment magnitude
-                    orig_total = orig_c1 + orig_c2
-                    adj_total = adj_c1 + adj_c2
+                    orig_total     = orig_c1 + orig_c2
+                    adj_total      = adj_c1  + adj_c2
+                    combined       = orig_c1 + orig_c2
                     adjustment_pct = (abs(adj_total - orig_total) / abs(orig_total) * 100) if orig_total != 0 else 0
-
-                    # Check if adjusted contributions became too small
-                    combined = orig_c1 + orig_c2
-                    c1_pct = (adj_c1 / combined * 100) if combined != 0 else 0
-                    c2_pct = (adj_c2 / combined * 100) if combined != 0 else 0
-                    small_contrib = adj_c1 < 0.05 * combined or adj_c2 < 0.05 * combined
+                    c1_pct         = (adj_c1 / combined * 100) if combined != 0 else 0
+                    c2_pct         = (adj_c2 / combined * 100) if combined != 0 else 0
+                    small_contrib  = adj_c1 < 0.05 * combined or adj_c2 < 0.05 * combined
 
                     contrib_df = pd.DataFrame([
-                        {"Description": f"Original contribution — {lbl1}",                "Value": orig_c1},
-                        {"Description": f"Original contribution — {lbl2}",                "Value": orig_c2},
-                        {"Description": f"Synergy-adjusted contribution — {lbl1}",        "Value": adj_c1},
-                        {"Description": f"Synergy-adjusted contribution — {lbl2}",        "Value": adj_c2},
-                        {"Description": f"Synergy contribution",                           "Value": syn_cab},
+                        {"Description": f"Original contribution — {lbl1}",         "Value": orig_c1},
+                        {"Description": f"Original contribution — {lbl2}",         "Value": orig_c2},
+                        {"Description": f"Synergy-adjusted contribution — {lbl1}", "Value": adj_c1},
+                        {"Description": f"Synergy-adjusted contribution — {lbl2}", "Value": adj_c2},
+                        {"Description": "Synergy contribution",                     "Value": syn_cab},
                     ]).set_index("Description")
-                    st.dataframe(
-                        contrib_df.style.format({"Value": "{:,.2f}"}),
-                        use_container_width=True,
-                    )
+                    st.dataframe(contrib_df.style.format({"Value": "{:,.2f}"}), use_container_width=True)
 
-                    # Show raw model outputs
+                    # Raw model outputs
                     st.markdown("**Raw Model Outputs** (before contribution scaling)")
-                    raw_c1 = res.get("raw_coeff1", 0.0)
-                    raw_c2 = res.get("raw_coeff2", 0.0)
+                    raw_c1  = res.get("raw_coeff1",  0.0)
+                    raw_c2  = res.get("raw_coeff2",  0.0)
                     raw_syn = res.get("raw_synergy", 0.0)
-                    raw_tot = res.get("raw_total", 1.0)
-
-                    raw_pct1 = (raw_c1 / raw_tot * 100) if raw_tot != 0 else 0
-                    raw_pct2 = (raw_c2 / raw_tot * 100) if raw_tot != 0 else 0
-                    raw_pct_syn = (raw_syn / raw_tot * 100) if raw_tot != 0 else 0
-
-                    raw_df = pd.DataFrame([
-                        {"Component": f"{d1} support × coefficient", "Sum": raw_c1, "% of Total": raw_pct1},
-                        {"Component": f"{d2} support × coefficient", "Sum": raw_c2, "% of Total": raw_pct2},
-                        {"Component": "Synergy support × coefficient", "Sum": raw_syn, "% of Total": raw_pct_syn},
-                        {"Component": "TOTAL", "Sum": raw_tot, "% of Total": 100.0},
+                    raw_tot = res.get("raw_total",   1.0)
+                    rp1     = (raw_c1  / raw_tot * 100) if raw_tot != 0 else 0
+                    rp2     = (raw_c2  / raw_tot * 100) if raw_tot != 0 else 0
+                    rp_syn  = (raw_syn / raw_tot * 100) if raw_tot != 0 else 0
+                    raw_df  = pd.DataFrame([
+                        {"Component": f"{lbl1} support × coefficient", "Sum": raw_c1,  "% of Total": rp1},
+                        {"Component": f"{lbl2} support × coefficient", "Sum": raw_c2,  "% of Total": rp2},
+                        {"Component": "Synergy support × coefficient",  "Sum": raw_syn, "% of Total": rp_syn},
+                        {"Component": "TOTAL",                          "Sum": raw_tot, "% of Total": 100.0},
                     ]).set_index("Component")
                     st.dataframe(
                         raw_df.style.format({"Sum": "{:,.2f}", "% of Total": "{:.1f}%"}),
                         use_container_width=True,
                     )
 
-                    # Warning if adjustment is significant
                     if adjustment_pct > 20:
                         st.warning(
                             f"⚠️ **Large adjustment detected** ({adjustment_pct:.1f}% change from original). "
-                            f"This may indicate that one variable's support pattern doesn't align well with the combined total."
+                            "This may indicate that one variable's support pattern doesn't align well "
+                            "with the combined total."
                         )
-
                     if small_contrib:
+                        lbl_small = lbl1 if adj_c1 < 0.05 * combined else lbl2
                         st.warning(
-                            f"⚠️ **Small adjusted contribution** — {lbl1 if adj_c1 < 0.05 * combined else lbl2} "
+                            f"⚠️ **Small adjusted contribution** — {lbl_small} "
                             f"adjusted contribution is < 5% of combined total. "
                             f"({c1_pct:.1f}% and {c2_pct:.1f}%)"
                         )
 
-                    # ── Chart ─────────────────────────────────────────────────────
-                    fig = create_synergy_chart(res, d1, d2)
-                    st.plotly_chart(fig, use_container_width=True)
+                    # Chart
+                    d1_disp = res.get("desc1") or res["var1"]
+                    d2_disp = res.get("desc2") or res["var2"]
+                    fig = create_synergy_chart(res, d1_disp, d2_disp)
+                    st.plotly_chart(
+                        fig, use_container_width=True,
+                        key=f"chart_{anchor_prefix}_{result_key}",
+                    )
 
-                    # ── Weekly Breakdown ──────────────────────────────────────────
+                    # Weekly breakdown
                     st.markdown("**Weekly Breakdown**")
                     weekly_data = pd.DataFrame({
-                        "Date": res["index"],
-                        d1: res["support1"] * res["coefficients"][0],
-                        d2: res["support2"] * res["coefficients"][1],
-                        "Synergy": res["synergy_support"] * res["coefficients"][2],
+                        "Date":     res["index"],
+                        lbl1:       res["support1"] * res["coefficients"][0],
+                        lbl2:       res["support2"] * res["coefficients"][1],
+                        "Synergy":  res["synergy_support"] * res["coefficients"][2],
                         "Combined": res["y_hat"],
-                        "Actual": res["y"],
+                        "Actual":   res["y"],
                     })
                     st.dataframe(
                         weekly_data.style.format({
-                            d1: "{:,.2f}",
-                            d2: "{:,.2f}",
-                            "Synergy": "{:,.2f}",
+                            lbl1:       "{:,.2f}",
+                            lbl2:       "{:,.2f}",
+                            "Synergy":  "{:,.2f}",
                             "Combined": "{:,.2f}",
-                            "Actual": "{:,.2f}",
+                            "Actual":   "{:,.2f}",
                         }),
                         use_container_width=True,
                         height=400,
                     )
 
-        # ── Detail panels: Bucket-Level ──────────────────────────────────────────
-        if bucket_synergies:
-            st.markdown("### Bucket-Level Details")
-            for idx, res in enumerate(bucket_synergies):
-                anchor = f"synergy-pair-bucket-{idx}"
-                d1 = res.get("desc1") or res["var1"]
-                d2 = res.get("desc2") or res["var2"]
-                title  = f"{d1}  x  {d2}"
-                subtitle = (
-                    f"({res['model1']})"
-                    if res["model1"] == res["model2"]
-                    else f"({res['model1']} / {res['model2']})"
-                )
+        # ── Render cross-bucket results ───────────────────────────────────────
+        if cross_synergies:
+            st.markdown("#### Cross-Bucket Synergies")
+            _render_summary_table(cross_synergies, "synergy-cross", "#2E4057")
+            st.divider()
+            st.markdown("### Cross-Bucket Details")
+            _render_detail_panels(cross_synergies, "synergy-cross")
 
-                # Inject anchor so the summary table links land here
-                st.markdown(f"<div id='{anchor}'></div>", unsafe_allow_html=True)
-
-                # Create unique key for this result (stable, not dependent on sort order)
-                result_key = f"{res['model1']}_{res['var1']}_{res['model2']}_{res['var2']}"
-
-                # Create expander with export checkbox
-                exp_col1, exp_col2 = st.columns([0.85, 0.15])
-                with exp_col1:
-                    expander = st.expander(f"{idx+1}.  {title}   {subtitle}", expanded=False)
-                with exp_col2:
-                    is_selected = st.checkbox(
-                        "Export",
-                        value=st.session_state.export_selection.get(result_key, False),
-                        key=f"export_checkbox_{result_key}",
-                        label_visibility="collapsed",
-                    )
-                    st.session_state.export_selection[result_key] = is_selected
-
-                with expander:
-                    # ── Key metrics ───────────────────────────────────────────────
-                    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-                    mc1.metric("R² Base",         f"{res['r2_base']:.4f}")
-                    mc2.metric("R² with Synergy", f"{res['r2_full']:.4f}")
-                    mc3.metric("Delta R²",         f"{res['delta_r2']:.4f}")
-                    mc4.metric("Synergy Coeff",    f"{res['coefficients'][2]:.4f}")
-                    mc5.metric("F-stat",           f"{res['f_stat']:.2f}")
-                    mc6.metric("p-value",          f"{res['p_value']:.4f}")
-
-                    st.caption(
-                        f"**{res['var1']}** | **{res['var2']}**  "
-                        f"|  Formulation: {res['synergy_formulation']}  "
-                        f"|  N = {res['n_obs']}  |  CI = {ci_pct}%"
-                    )
-
-                    # ── CI table ──────────────────────────────────────────────────
-                    lbl1 = f"{d1} ({res['var1']})"
-                    lbl2 = f"{d2} ({res['var2']})"
-                    ci_df = pd.DataFrame({
-                        "Variable":              [lbl1, lbl2, "Synergy"],
-                        "Coefficient":           res["coefficients"],
-                        f"CI Lower ({ci_pct}%)": res["ci_lower"],
-                        f"CI Upper ({ci_pct}%)": res["ci_upper"],
-                    }).set_index("Variable")
-                    st.dataframe(ci_df.style.format("{:.6f}"), use_container_width=True)
-
-                    # ── Contribution breakdown ────────────────────────────────────
-                    st.markdown("**Contribution Breakdown** — sum over analysis period")
-                    orig_c1  = res.get("orig_contrib1",  0.0)
-                    orig_c2  = res.get("orig_contrib2",  0.0)
-                    adj_c1   = res.get("adj_contrib1",   orig_c1)
-                    adj_c2   = res.get("adj_contrib2",   orig_c2)
-                    syn_cab  = res.get("synergy_contrib", 0.0)
-
-                    # Calculate adjustment magnitude
-                    orig_total = orig_c1 + orig_c2
-                    adj_total = adj_c1 + adj_c2
-                    adjustment_pct = (abs(adj_total - orig_total) / abs(orig_total) * 100) if orig_total != 0 else 0
-
-                    # Check if adjusted contributions became too small
-                    combined = orig_c1 + orig_c2
-                    c1_pct = (adj_c1 / combined * 100) if combined != 0 else 0
-                    c2_pct = (adj_c2 / combined * 100) if combined != 0 else 0
-                    small_contrib = adj_c1 < 0.05 * combined or adj_c2 < 0.05 * combined
-
-                    contrib_df = pd.DataFrame([
-                        {"Description": f"Original contribution — {lbl1}",                "Value": orig_c1},
-                        {"Description": f"Original contribution — {lbl2}",                "Value": orig_c2},
-                        {"Description": f"Synergy-adjusted contribution — {lbl1}",        "Value": adj_c1},
-                        {"Description": f"Synergy-adjusted contribution — {lbl2}",        "Value": adj_c2},
-                        {"Description": f"Synergy contribution",                           "Value": syn_cab},
-                    ]).set_index("Description")
-                    st.dataframe(
-                        contrib_df.style.format({"Value": "{:,.2f}"}),
-                        use_container_width=True,
-                    )
-
-                    # Show raw model outputs
-                    st.markdown("**Raw Model Outputs** (before contribution scaling)")
-                    raw_c1 = res.get("raw_coeff1", 0.0)
-                    raw_c2 = res.get("raw_coeff2", 0.0)
-                    raw_syn = res.get("raw_synergy", 0.0)
-                    raw_tot = res.get("raw_total", 1.0)
-
-                    raw_pct1 = (raw_c1 / raw_tot * 100) if raw_tot != 0 else 0
-                    raw_pct2 = (raw_c2 / raw_tot * 100) if raw_tot != 0 else 0
-                    raw_pct_syn = (raw_syn / raw_tot * 100) if raw_tot != 0 else 0
-
-                    raw_df = pd.DataFrame([
-                        {"Component": f"{d1} support × coefficient", "Sum": raw_c1, "% of Total": raw_pct1},
-                        {"Component": f"{d2} support × coefficient", "Sum": raw_c2, "% of Total": raw_pct2},
-                        {"Component": "Synergy support × coefficient", "Sum": raw_syn, "% of Total": raw_pct_syn},
-                        {"Component": "TOTAL", "Sum": raw_tot, "% of Total": 100.0},
-                    ]).set_index("Component")
-                    st.dataframe(
-                        raw_df.style.format({"Sum": "{:,.2f}", "% of Total": "{:.1f}%"}),
-                        use_container_width=True,
-                    )
-
-                    # Warning if adjustment is significant
-                    if adjustment_pct > 20:
-                        st.warning(
-                            f"⚠️ **Large adjustment detected** ({adjustment_pct:.1f}% change from original). "
-                            f"This may indicate that one variable's support pattern doesn't align well with the combined total."
-                        )
-
-                    if small_contrib:
-                        st.warning(
-                            f"⚠️ **Small adjusted contribution** — {lbl1 if adj_c1 < 0.05 * combined else lbl2} "
-                            f"adjusted contribution is < 5% of combined total. "
-                            f"({c1_pct:.1f}% and {c2_pct:.1f}%)"
-                        )
-
-                    # ── Chart ─────────────────────────────────────────────────────
-                    fig = create_synergy_chart(res, d1, d2)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # ── Weekly Breakdown ──────────────────────────────────────────
-                    st.markdown("**Weekly Breakdown**")
-                    weekly_data = pd.DataFrame({
-                        "Date": res["index"],
-                        d1: res["support1"] * res["coefficients"][0],
-                        d2: res["support2"] * res["coefficients"][1],
-                        "Synergy": res["synergy_support"] * res["coefficients"][2],
-                        "Combined": res["y_hat"],
-                        "Actual": res["y"],
-                    })
-                    st.dataframe(
-                        weekly_data.style.format({
-                            d1: "{:,.2f}",
-                            d2: "{:,.2f}",
-                            "Synergy": "{:,.2f}",
-                            "Combined": "{:,.2f}",
-                            "Actual": "{:,.2f}",
-                        }),
-                        use_container_width=True,
-                        height=400,
-                    )
+        # ── Render intra-bucket results ───────────────────────────────────────
+        if intra_synergies:
+            st.markdown("#### Intra-Bucket Synergies")
+            _render_summary_table(intra_synergies, "synergy-intra", "#8B6F47")
+            st.divider()
+            st.markdown("### Intra-Bucket Details")
+            _render_detail_panels(intra_synergies, "synergy-intra")
 
 
-# ── Sidebar: Export (shown whenever significant results are available) ────────
+# ── Sidebar: Export (save to folder) ─────────────────────────────────────────
 _cached_results = st.session_state.get("all_results", [])
-_sig_export     = [r for r in _cached_results if r.get("is_significant")]
+_cross_sig      = [r for r in _cached_results if r.get("is_significant") and r.get("pair_type") == "cross_bucket"]
+_intra_sig      = [r for r in _cached_results if r.get("is_significant") and r.get("pair_type") == "intra_bucket"]
 _export_country = st.session_state.get("result_country", selected_country)
+
+
+def _safe_name(s: str, max_len: int = 28) -> str:
+    return re.sub(r"[^\w\-]", "_", s)[:max_len]
+
+
+# Group significant results by model (needed both for summary display and on save)
+_cross_by_model: dict = defaultdict(list)
+for _r in _cross_sig:
+    _cross_by_model[_r["model1"]].append(_r)
+
+_intra_by_model: dict = defaultdict(list)
+for _r in _intra_sig:
+    _intra_by_model[_r["model1"]].append(_r)
+
+_all_export_models = sorted(
+    set(list(_cross_by_model.keys()) + list(_intra_by_model.keys()))
+)
 
 with st.sidebar:
     st.divider()
     st.subheader("Export Results")
-    if _sig_export:
-        # Get selected pairs for export
-        _export_selection = st.session_state.get("export_selection", {})
-        _selected_pairs = []
-        for res in _sig_export:
-            result_key = f"{res['model1']}_{res['var1']}_{res['model2']}_{res['var2']}"
-            if _export_selection.get(result_key, False):
-                _selected_pairs.append(res)
 
-        if _selected_pairs:
-            st.caption(f"**{len(_selected_pairs)}** of **{len(_sig_export)}** pairs selected for export")
-
-            xlsx_data = export_to_excel(_selected_pairs, _export_country)
-            st.download_button(
-                label="📊 Download Excel",
-                data=xlsx_data,
-                file_name=f"synergy_{_export_country}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            pdf_data = export_to_pdf(_selected_pairs, _export_country)
-            st.download_button(
-                label="📄 Download PDF",
-                data=pdf_data,
-                file_name=f"synergy_{_export_country}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        else:
-            st.caption(f"Select synergy pairs above to enable export ({len(_sig_export)} available)")
-    else:
+    if not _cross_sig and not _intra_sig:
         st.caption("Run analysis to enable export.")
+    else:
+        # Summary of what will be exported
+        for _model in _all_export_models:
+            _m_cross = _cross_by_model.get(_model, [])
+            _m_intra = _intra_by_model.get(_model, [])
+            _m_total = len(_m_cross) + len(_m_intra)
+            st.markdown(f"**{_model}**")
+            st.caption(
+                f"{_m_total} synerg{'ies' if _m_total != 1 else 'y'} "
+                f"({len(_m_cross)} cross-bucket, {len(_m_intra)} intra-bucket)"
+            )
+
+        st.divider()
+
+        _default_folder = str(Path.home() / "Desktop" / "synergy_output")
+        _out_folder = st.text_input(
+            "Output folder",
+            value=st.session_state.get("_out_folder", _default_folder),
+            help="Files are written directly to this path. Created automatically if it doesn't exist.",
+        )
+        st.session_state["_out_folder"] = _out_folder
+
+        if st.button("Save Results to Folder", type="primary", use_container_width=True):
+            _now_ts = datetime.now().strftime("%Y%m%d_%H%M")
+            try:
+                _out_path = Path(_out_folder)
+                _out_path.mkdir(parents=True, exist_ok=True)
+
+                _saved: list = []
+                _errs:  list = []
+
+                for _model in _all_export_models:
+                    _safe_m  = _safe_name(_model)
+                    _m_cross = _cross_by_model.get(_model, [])
+                    _m_intra = _intra_by_model.get(_model, [])
+
+                    for _res_list, _tag in [(_m_cross, "bucket"), (_m_intra, "variable")]:
+                        if not _res_list:
+                            continue
+                        try:
+                            _xl_name  = f"synergy_{_tag}_{_safe_m}_{_now_ts}.xlsx"
+                            _pdf_name = f"synergy_{_tag}_{_safe_m}_{_now_ts}.pdf"
+                            (_out_path / _xl_name).write_bytes(
+                                export_to_excel(_res_list, _export_country).read()
+                            )
+                            (_out_path / _pdf_name).write_bytes(
+                                export_to_pdf(_res_list, _export_country).read()
+                            )
+                            _saved.extend([_xl_name, _pdf_name])
+                        except Exception as _exc:
+                            _errs.append(f"{_model} ({_tag}): {_exc}")
+
+                if _saved:
+                    st.success(f"Saved {len(_saved)} file(s) to:\n`{_out_folder}`")
+                    for _f in _saved:
+                        st.caption(f"• {_f}")
+                if _errs:
+                    for _e in _errs:
+                        st.error(f"Error — {_e}")
+
+            except Exception as _exc:
+                st.error(f"Could not write to folder: {_exc}")
